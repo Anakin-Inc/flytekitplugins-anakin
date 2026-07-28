@@ -30,6 +30,12 @@ dependencies = [
     # flyteorg/flyte's Pydantic BaseModel docs, not assumed.
     "flytekit>=1.14.0,<2.0.0",
     "anakin-sdk>=0.1.0,<0.2.0",
+    # Used directly by flytekitplugins/anakin/_http.py for the endpoints
+    # anakin-sdk v0.1.0 doesn't implement yet (Wire discovery/catalog/
+    # identities/login/build, monitors, AI visibility, browser_task) — same
+    # HTTP library anakin-sdk itself uses internally, so no new transport
+    # dependency is introduced, just a direct one instead of transitive.
+    "httpx>=0.27.0,<1.0.0",
 ]
 
 # NOTE: no `entry_points = {"flytekit.plugins": ...}` here. Per
@@ -43,8 +49,8 @@ dependencies = [
 [project.urls]
 Homepage = "https://anakin.io"
 Documentation = "https://anakin.io/docs"
-Repository = "https://github.com/Anakin-Inc/anakin-flyte-plugin"
-Issues = "https://github.com/Anakin-Inc/anakin-flyte-plugin/issues"
+Repository = "https://github.com/Anakin-Inc/flytekitplugins-anakin"
+Issues = "https://github.com/Anakin-Inc/flytekitplugins-anakin/issues"
 
 [dependency-groups]
 test = [

@@ -1,5 +1,65 @@
 # flytekitplugins-anakin — verification status
 
+## Full coverage (`feat/full-tool-coverage`)
+
+The initial build covered 3 of Anakin's 21 API capabilities
+(`scrape_url`, `search`, `agentic_search`), by deliberate scope decision
+(see below — still the correct call). This pass adds the remaining 18 as
+`@task` functions, same pattern, following two strategies chosen per
+capability based on what `anakin-sdk` v0.1.0 actually implements (read
+directly from `anakin-py/src/anakin/client.py` in full, not assumed):
+
+- **6 wrap `anakin-sdk`** (like the original 3): `map_site` (`Anakin.map`),
+  `crawl_site` (`Anakin.crawl`), `wire_read_action` / `wire_write_action`
+  (both call `Anakin.wire`, split into two tasks purely so a workflow
+  author's choice of task is an explicit signal about whether a step can
+  change state on a third-party site — mirrors the same split in
+  `anakin-mcp/src/tools/wire.ts`), `session_list` / `session_delete`
+  (`Anakin.sessions.list` / `.delete`).
+- **12 call the REST API directly** via a small `httpx`-based helper
+  (`flytekitplugins/anakin/_http.py`), because `anakin-sdk` v0.1.0 doesn't
+  implement them: `wire_discover`, `wire_catalog`, `wire_identities`,
+  `wire_login`, `wire_build`, `monitor_create`, `monitor_list`,
+  `monitor_changes`, `monitor_control`, `ai_visibility_sources`,
+  `ai_visibility_search`, `browser_task`. Every path/verb/poll-target for
+  these was read from `anakin-mcp/src/client.ts` — Anakin's own MCP server,
+  a second independent implementation against the same REST API — not
+  invented. `_http.py` reuses the same auth header, dual-shape error
+  tolerance, and retry/poll backoff `anakin._http.HttpClient` applies
+  internally to SDK-covered endpoints, so error/retry behavior is
+  consistent across every task in this package.
+
+One correction to the original scope-decision text below: this pass found
+`anakin-sdk`'s `Anakin.sessions` sub-client (`list`/`create`/`save`/
+`update`/`delete`) already covers browser-session listing and deletion —
+contrary to an initial assumption that all of `monitor_*`/`ai_visibility_*`/
+`session_*`/`browser_task` were missing from the SDK. Verified directly
+against `anakin-py/src/anakin/client.py`'s `SessionsClient` class before
+writing `session_list`/`session_delete`, so those two route through the SDK
+like the original 3 tasks, not through `_http.py`.
+
+`anakin-sdk` v0.1.0's `Anakin.wire()` does not accept `credential_id` /
+`identity_id`, though the REST API supports both for auth-required actions
+(`WireRunOptions` in `anakin-mcp/src/client.ts`) — `wire_read_action` /
+`wire_write_action` inherit that gap and will raise `WireAuthRequiredError`
+for actions needing auth until the SDK adds the parameter. Documented in
+both `README.md` and the tasks' own docstrings, not silently dropped.
+
+`pyproject.toml`'s `Repository`/`Issues` URLs were also corrected in this
+pass — they pointed at `Anakin-Inc/anakin-flyte-plugin`, but `git remote -v`
+shows the real repo is `Anakin-Inc/flytekitplugins-anakin` (matching the
+published package name, and this repo's actual `origin`).
+
+Tests: `tests/test_tasks.py` grew from 5 to 29 tests, covering all 21
+tasks — SDK-backed tasks mock `flytekitplugins.anakin.tasks.Anakin`
+(unchanged pattern); the 12 raw-HTTP tasks mock
+`flytekitplugins.anakin.tasks._http.request`/`.poll` to test the
+task-to-REST wiring (method, path, body, response shaping — including the
+`alertWebhookSecret` redaction on every monitor response and the
+`full_content` stripping on `ai_visibility_search`) without hitting the
+network. Same "never run, `flytekit` not installed here" caveat as below
+applies to this expanded suite too.
+
 ## Live-verified, not assumed
 
 - `anakin-sdk` is **live on PyPI right now** (confirmed via
@@ -105,9 +165,10 @@
   `SearchResult`, `AgenticSearchResult`) read from
   `anakin-py/src/anakin/models.py`.
 
-- All 6 source files (`flytekitplugins/anakin/*.py`,
-  `example_workflows/*.py`, `tests/*.py`) pass `python3 -m py_compile` —
-  syntactically valid. Output shown in this session's transcript.
+- All 7 source files (`flytekitplugins/anakin/*.py` — `__init__.py`,
+  `tasks.py`, `_http.py` — plus `example_workflows/*.py`, `tests/*.py`)
+  pass `python3 -m py_compile` — syntactically valid. Output shown in this
+  session's transcript.
 
 ## What's NOT verified
 
@@ -118,13 +179,15 @@ network-restricted-sandbox pattern hit by every other Python package built
 this session (`langchain-anakin`, `airflow-provider-anakin`,
 `dagster-anakin`). So:
 
-- `tests/test_tasks.py` (5 tests) was **written but never run**. It mocks
-  `flytekitplugins.anakin.tasks.Anakin` entirely and calls the `@task`
-  functions directly — flytekit's own documented pattern for exercising
-  tasks without a running Flyte backend ("local execution") — but that
-  local-execution path itself still needs `flytekit` installed to build the
-  `FlyteContext`, run the type engine's input/output transforms, etc. None
-  of that was exercised here.
+- `tests/test_tasks.py` (29 tests as of `feat/full-tool-coverage`, up from
+  5) was **written but never run**. SDK-backed tasks mock
+  `flytekitplugins.anakin.tasks.Anakin` entirely; the 12 raw-HTTP tasks mock
+  `flytekitplugins.anakin.tasks._http.request`/`.poll` — both are flytekit's
+  own documented pattern for exercising tasks without a running Flyte
+  backend ("local execution"), calling the `@task` functions directly — but
+  that local-execution path itself still needs `flytekit` installed to
+  build the `FlyteContext`, run the type engine's input/output transforms,
+  etc. None of that was exercised here.
 - `example_workflows/example_anakin.py` was `py_compile`d only — never run
   with `pyflyte run`, never registered or executed against a real Flyte
   cluster or `pyflyte serialize`d.
@@ -164,7 +227,9 @@ this session (`langchain-anakin`, `airflow-provider-anakin`,
    `anakin`/`api-key` secret with a real Anakin API key, then
    `pyflyte run --remote example_workflows/example_anakin.py
    anakin_research_wf` end-to-end.
-4. Push as `Anakin-Inc/anakin-flyte-plugin`, publish to PyPI as
+4. Push as `Anakin-Inc/flytekitplugins-anakin` (this repo's actual
+   `origin`; `pyproject.toml`'s `Repository`/`Issues` URLs were corrected to
+   match in `feat/full-tool-coverage`), publish to PyPI as
    `flytekitplugins-anakin`.
 5. Optional, once live: open a PR to add a row to
    `flyteorg/flytekit`'s `plugins/README.md` plugin table (the doc says

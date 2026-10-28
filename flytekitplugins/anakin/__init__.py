@@ -1,45 +1,43 @@
 """
 .. currentmodule:: flytekitplugins.anakin
 
-Flyte tasks for `Anakin <https://anakin.io>`_ (https://api.anakin.io/v1) —
-web scraping, mapping, crawling, AI-powered search and agentic research,
-Wire pre-built site automation, website monitoring, AI visibility, browser
-sessions, and AI browser automation. Built on the official ``anakin-sdk``
-Python client where it covers the endpoint, and direct REST calls
-(``httpx``) where it doesn't yet — see ``tasks.py``'s module docstring and
-``README.md``'s task table for which is which.
+Flyte tasks for `Anakin <https://anakin.io>`_, a web data API: scrape and
+crawl sites to markdown, AI web search and research, Wire site actions,
+website monitors, AI visibility and AI browser tasks. Built on the official
+``anakin-sdk`` client.
 
 .. autosummary::
    :template: custom.rst
    :toctree: generated/
 
    scrape_url
-   search
-   agentic_search
    map_site
    crawl_site
+   search
+   agentic_search
+   wire_discover
+   wire_catalogs
+   wire_catalog
    wire_read_action
    wire_write_action
-   wire_discover
-   wire_catalog
    wire_identities
    wire_login
    wire_build
-   session_list
-   session_delete
+   wire_build_status
    monitor_create
    monitor_list
+   monitor_get
    monitor_changes
    monitor_control
    ai_visibility_sources
    ai_visibility_search
+   session_list
+   session_delete
    browser_task
-   ANAKIN_SECRET_GROUP
-   ANAKIN_SECRET_KEY
-   DEFAULT_ANAKIN_BASE_URL
 """
 
-from .tasks import (
+from flytekitplugins.anakin._version import __version__
+from flytekitplugins.anakin.tasks import (
     ANAKIN_SECRET_GROUP,
     ANAKIN_SECRET_KEY,
     DEFAULT_ANAKIN_BASE_URL,
@@ -52,13 +50,16 @@ from .tasks import (
     monitor_changes,
     monitor_control,
     monitor_create,
+    monitor_get,
     monitor_list,
     scrape_url,
     search,
     session_delete,
     session_list,
     wire_build,
+    wire_build_status,
     wire_catalog,
+    wire_catalogs,
     wire_discover,
     wire_identities,
     wire_login,
@@ -70,6 +71,7 @@ __all__ = [
     "ANAKIN_SECRET_GROUP",
     "ANAKIN_SECRET_KEY",
     "DEFAULT_ANAKIN_BASE_URL",
+    "__version__",
     "agentic_search",
     "ai_visibility_search",
     "ai_visibility_sources",
@@ -79,13 +81,16 @@ __all__ = [
     "monitor_changes",
     "monitor_control",
     "monitor_create",
+    "monitor_get",
     "monitor_list",
     "scrape_url",
     "search",
     "session_delete",
     "session_list",
     "wire_build",
+    "wire_build_status",
     "wire_catalog",
+    "wire_catalogs",
     "wire_discover",
     "wire_identities",
     "wire_login",

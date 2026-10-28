@@ -1,154 +1,158 @@
 # flytekitplugins-anakin
 
-Flyte tasks for [Anakin](https://anakin.io) — web scraping, mapping,
-crawling, AI-powered search and agentic research, Wire pre-built site
-automation, website monitoring, AI visibility, browser sessions, and AI
-browser automation. All 21 of Anakin's API capabilities, built on the
-official [`anakin-sdk`](https://github.com/Anakin-Inc/anakin-py) Python
-client where it already covers the endpoint, and direct REST calls
-otherwise — see the task table below.
+Flyte tasks for [Anakin](https://anakin.io), a web data API. Scrape and crawl
+sites to markdown, run AI web search and research, run pre-built Wire actions
+on hundreds of sites, watch pages for changes, and drive an AI agent in a cloud
+browser, all as typed tasks in your Flyte workflows.
 
-## Scope: plain `@task` functions, not a custom Task subclass
-
-This package is **21 `@task`-decorated Python functions**, not a custom
-`PythonTask` subclass or a Flyte backend connector. That's a deliberate
-scope decision based on reading Flyte's own docs, not a shortcut:
-
-- Flyte's task-plugins documentation states that a standard
-  `@task`-decorated function wrapping a third-party API call requires no
-  plugin machinery — "it's simply a normal Python function." Custom
-  `PythonTask`/connector subclasses exist for cases needing custom
-  serialization, remote execution semantics, or cluster-side infrastructure.
-  For comparison, `flytekitplugins-openai`'s `ChatGPTTask` mixes in
-  `SyncConnectorExecutorMixin` and needs a **connector service deployed on
-  the Flyte cluster itself** to run — real infrastructure, appropriate for
-  OpenAI's job model, not appropriate here.
-- Every endpoint here is a plain synchronous HTTP call, a submit-and-poll
-  call, or a plain CRUD call — nothing that needs custom serialization or
-  cluster-side infrastructure. Where `anakin-sdk` already implements an
-  endpoint, a task body just calls the SDK client. Where it doesn't (12 of
-  the 21 — see the table below), a task body makes a direct `httpx` call
-  using the same auth header and retry/poll behavior the SDK itself uses
-  internally (`flytekitplugins/anakin/_http.py`). Either way: no custom
-  container, no backend plugin, no cluster-side component required.
-
-The package is still laid out as a `flytekitplugins.*` namespace-package
-microlib per `flyteorg/flytekit`'s own plugin-authoring convention
-(`plugins/README.md`) — so `pip install flytekitplugins-anakin` and
-`from flytekitplugins.anakin import scrape_url` read exactly like any other
-flytekit plugin. See `SUBMIT.md` for the full research trail and what was
-and wasn't verified.
+Built on the official [`anakin-sdk`](https://pypi.org/project/anakin-sdk/)
+Python client. Supports flytekit 1.14+ on Python 3.10 to 3.13. The tasks are
+plain `@task` functions, so they run locally with `pyflyte run` and on any
+Flyte cluster with no backend plugin or connector to deploy.
 
 ## Install
 
 ```bash
-pip install -U flytekitplugins-anakin
+pip install flytekitplugins-anakin
 ```
 
-## Auth
+Add it to the image your tasks run in, for example with `ImageSpec`:
 
-Tasks read the Anakin API key from Flyte's secret manager
-(`group="anakin"`, `key="api-key"`) via
-`flytekit.current_context().secrets.get(...)` — the documented Flyte
-pattern for injecting credentials into a task without putting them in task
-inputs or workflow code.
+```python
+from flytekit import ImageSpec
 
-Create the secret before running against a real Flyte cluster, e.g.:
+image = ImageSpec(packages=["flytekitplugins-anakin"])
+```
+
+## Credentials
+
+Get an API key at [anakin.io/dashboard](https://anakin.io/dashboard). The free
+tier needs no card.
+
+On a cluster, store it as a Flyte secret in group `anakin`, key `api-key`. The
+tasks already request it:
 
 ```bash
-flytectl create secret --name api-key --group anakin --value ask-...
+kubectl create secret generic anakin --from-literal=api-key=ask_... -n <project>-<domain>
 ```
 
-If no secret is mounted, tasks fall back to the `ANAKIN_API_KEY`
-environment variable — the same fallback `anakin.Anakin()` itself
-implements — so they also work with `pyflyte run` locally, no Flyte backend
-or secret manager involved at all:
+(Or `flytectl create secret` / your deployment's secret manager. See
+[Flyte secrets](https://docs.flyte.org/en/latest/user_guide/productionizing/secrets.html).)
+
+Locally, set `ANAKIN_API_KEY` instead. The tasks read the Flyte secret first,
+then the environment variable. With no key at all, `scrape_url`,
+`wire_discover`, `wire_catalogs` and `wire_catalog` still work on a small free
+allowance, which is enough to try the package.
+
+## Example
+
+```python
+import functools
+
+from anakin.models import Document
+from flytekit import map_task, task, workflow
+from flytekitplugins.anakin import scrape_url, search
+
+
+@task
+def word_counts(docs: list[Document]) -> dict:
+    return {doc.url: len((doc.markdown or "").split()) for doc in docs}
+
+
+# map_task maps over `url` and needs every other input bound, defaults included.
+scrape = functools.partial(
+    scrape_url,
+    country="us",
+    use_browser=False,
+    generate_json=False,
+    output_schema=None,
+    formats=None,
+    force_fresh=False,
+    session_id=None,
+    session_name=None,
+    poll_timeout=None,
+)
+
+
+@workflow
+def pages(urls: list[str]) -> dict:
+    docs = map_task(scrape)(url=urls)
+    return word_counts(docs=docs)
+
+
+@workflow
+def news(topic: str) -> str:
+    return search(prompt=f"{topic} news this week", limit=5).results[0].url
+```
 
 ```bash
-ANAKIN_API_KEY=ask-... pyflyte run example_workflows/example_anakin.py anakin_research_wf
+pyflyte run example.py pages --urls '["https://example.com", "https://anakin.io"]'
 ```
+
+More in [`example_workflows/example_anakin.py`](example_workflows/example_anakin.py).
 
 ## Tasks
 
-| Task | What it does | Implementation |
+| Task | What it does | Output |
 |---|---|---|
-| `scrape_url` | Scrape a URL to markdown (+ optional formats / AI-extracted JSON) | `anakin-sdk` (`Anakin.scrape`) |
-| `search` | Synchronous AI-powered web search with citations | `anakin-sdk` (`Anakin.search`) |
-| `agentic_search` | Multi-stage research: search, scrape citations, extract structured data with a summary | `anakin-sdk` (`Anakin.agentic_search`) |
-| `map_site` | Discover all reachable URLs under a site (sitemap + link traversal) | `anakin-sdk` (`Anakin.map`) |
-| `crawl_site` | Bulk-fetch markdown across a site (catalog ingestion, RAG corpus) | `anakin-sdk` (`Anakin.crawl`) |
-| `wire_read_action` | Run a Wire pre-built READ action (extracts data, e.g. product price/specs) | `anakin-sdk` (`Anakin.wire`) |
-| `wire_write_action` | Run a Wire pre-built WRITE action (state-changing, e.g. submit a form) | `anakin-sdk` (`Anakin.wire`) |
-| `wire_discover` | Find Wire actions for a task from a natural-language intent | raw HTTP (`GET /wire/resolve`) |
-| `wire_catalog` | Browse the Wire catalog, or one site's full action list | raw HTTP (`GET /wire/catalog[/:slug]`) |
-| `wire_identities` | List your saved Wire identities and credentials | raw HTTP (`GET /wire/identities`) |
-| `wire_login` | Sign in to a credentials-mode Wire site, get a `credential_id` | raw HTTP (`POST /wire/login`) |
-| `wire_build` | Request a brand-new Wire action for an uncatalogued site | raw HTTP (`POST /wire/build-request`) |
-| `session_list` | List saved browser sessions (encrypted login state) | `anakin-sdk` (`Anakin.sessions.list`) |
-| `session_delete` | Permanently delete a saved browser session | `anakin-sdk` (`Anakin.sessions.delete`) |
-| `monitor_create` | Create a scheduled website monitor (page/site/Wire scope) | raw HTTP (`POST /monitors`) |
-| `monitor_list` | List monitors, or fetch one by id | raw HTTP (`GET /monitors[/:id]`) |
-| `monitor_changes` | Get a monitor's detected changes | raw HTTP (`GET /monitors/:id/changes`) |
-| `monitor_control` | Pause / resume / run-now / delete a monitor | raw HTTP (`POST .../{pause,resume,run}`, `DELETE`) |
-| `ai_visibility_sources` | List AI answer engines available to `ai_visibility_search` | raw HTTP (`GET /ai-visibility/sources`) |
-| `ai_visibility_search` | Ask multiple AI engines (ChatGPT, Gemini, ...) the same question, compare answers | raw HTTP (`POST /ai-visibility/search` + poll) |
-| `browser_task` | Run a natural-language task in a real AI-driven cloud browser | raw HTTP (`POST /ai/evaluate` + poll) |
+| `scrape_url` | Scrape a URL to markdown, optionally extract JSON with AI | `Document` |
+| `map_site` | List the URLs on a site (sitemap plus link traversal) | `MapResult` |
+| `crawl_site` | Fetch markdown for many pages of a site in one job | `CrawlResult` |
+| `search` | AI web search with citations | `SearchResult` |
+| `agentic_search` | Multi-step research returning a summary and structured data | `AgenticSearchResult` |
+| `wire_discover` | Find Wire actions for a task described in plain language | `list[WireActionMatch]` |
+| `wire_catalogs` | List every site in the Wire catalog | `list[WireCatalog]` |
+| `wire_catalog` | One site's Wire actions and login fields | `WireCatalogDetail` |
+| `wire_read_action` | Run a Wire action that reads data | `WireResult` |
+| `wire_write_action` | Run a Wire action that changes state (form, cart, post) | `WireResult` |
+| `wire_identities` | List saved Wire identities and their credentials | `list[WireIdentity]` |
+| `wire_login` | Sign in to a site and get a `credential_id` | `WireLoginResult` |
+| `wire_build` | Request a new Wire action for a site not in the catalog | `WireBuildRequest` |
+| `wire_build_status` | Check a build request | `WireBuildRequest` |
+| `monitor_create` | Create a scheduled website monitor (page, site or Wire) | `Monitor` |
+| `monitor_list` / `monitor_get` | List monitors, or fetch one | `list[Monitor]` / `Monitor` |
+| `monitor_changes` | A monitor's detected changes | `list[MonitorChange]` |
+| `monitor_control` | Pause, resume, run now or delete a monitor | `dict` or `None` |
+| `ai_visibility_sources` | AI answer engines available to `ai_visibility_search` | `list[AIVisibilitySource]` |
+| `ai_visibility_search` | Ask several AI engines one question and compare answers | `AIVisibilitySearch` |
+| `session_list` | List saved browser sessions (logged-in states) | `list[BrowserSession]` |
+| `session_delete` | Delete a saved browser session | `None` |
+| `browser_task` | Run a plain-language task in an AI-driven cloud browser | `dict` |
 
-"raw HTTP" tasks call the REST API directly via `httpx` (see
-`flytekitplugins/anakin/_http.py`) because `anakin-sdk` v0.1.0 doesn't
-implement those 12 endpoints yet — confirmed by reading
-`anakin-py/src/anakin/client.py` in full, not assumed. Ground truth for
-every one of those endpoints (path, verb, request/response shape, polling
-target) is `anakin-mcp/src/client.ts`, Anakin's own MCP server — a second,
-independent implementation against the same REST API.
+Outputs are `anakin.models` Pydantic models, which flytekit serializes
+natively, so downstream tasks get typed objects (`doc.markdown`,
+`result.data`). Free-form JSON inputs such as `params` and `output_schema` are
+plain `dict`.
 
-```python
-from flytekit import workflow
-from flytekitplugins.anakin import scrape_url, search, wire_discover
-from anakin.models import Document, SearchResult
+## Notes
 
-@workflow
-def my_wf() -> SearchResult:
-    doc: Document = scrape_url(url="https://example.com")
-    candidates = wire_discover(q="top phones on walmart")
-    return search(prompt="latest AI agent news")
-```
-
-Tasks backed by `anakin-sdk` return the SDK's Pydantic model
-(`Document`, `SearchResult`, `AgenticSearchResult`, `MapResult`,
-`CrawlResult`, `WireResult`, `list[BrowserSession]`) directly as their
-output type — flytekit >= 1.14 natively serializes Pydantic v2 `BaseModel`
-task outputs (MessagePack-encoded), so no manual `model_dump()` flattening
-is needed. Raw-HTTP tasks (no corresponding SDK model exists yet) return
-`dict[str, Any]` — the API's JSON response, normalized to a dict.
-
-See `example_workflows/example_anakin.py` for full runnable examples,
-including the original research pipeline plus a second workflow exercising
-Wire discovery, website monitoring, and AI visibility.
-
-## A note on Wire auth (`credential_id`)
-
-`anakin-sdk` v0.1.0's `Anakin.wire()` does not yet accept `credential_id` /
-`identity_id`, even though the REST API supports both for auth-required
-actions (confirmed by reading `anakin-py/src/anakin/client.py` in full).
-`wire_read_action` / `wire_write_action` in this package inherit that
-limitation — actions with `auth_mode="required"` will raise
-`WireAuthRequiredError` until the SDK adds the parameter. Use
-`wire_identities` / `wire_login` to obtain a `credential_id` today; it can
-be threaded through once `anakin-sdk` exposes it on `wire()`.
+- **Retries and caching.** The SDK already retries 429 and 5xx responses.
+  Read tasks are safe to give Flyte `retries` or `cache=True` with
+  `with_overrides` or your own wrapper. Don't do that for `wire_write_action`,
+  `wire_login`, `wire_build` or `monitor_create`: repeating them repeats the
+  write.
+- **Payments.** `wire_write_action`, `wire_build` and `browser_task` refuse
+  anything that looks like a payment or fund transfer, the same rule as
+  Anakin's MCP server. Set `ANAKIN_ALLOW_FINANCIAL=true` to turn that off.
+- **Secrets in outputs.** Flyte stores task inputs and outputs. Monitor
+  outputs have their webhook signing secret redacted. Don't pass passwords to
+  `wire_login` as literals from workflow code; read them from a Flyte secret
+  inside a task, or use a 1Password `source_id`.
+- **Base URL.** Set `ANAKIN_BASE_URL` to point at a non-production API.
+- flytekit may log `Unsupported Type typing.Any found` on import. It comes
+  from flytekit building attribute-access metadata for model fields typed
+  `Any` (Wire `data`, for example); the outputs themselves are serialized as
+  MessagePack, not pickle.
 
 ## Development
 
-This package depends on `anakin-sdk` (live on PyPI), `flytekit`, and
-`httpx` (used directly by `_http.py` for the 12 endpoints not yet in
-`anakin-sdk`).
-
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[test]"
-pytest
+uv venv && uv pip install -e . --group test --group lint
+uv run pytest
+uv run ruff check . && uv run mypy flytekitplugins
+ANAKIN_LIVE_TESTS=1 uv run pytest tests/test_live.py   # calls the live API
 ```
 
 ## License
 
-Apache-2.0.
+Apache-2.0

@@ -1,68 +1,98 @@
-"""Example Flyte workflows for the Anakin tasks.
+"""Example Flyte workflows using flytekitplugins-anakin.
 
-Not part of the installable package (not under ``flytekitplugins/``) —
-provided for reference, the same way flytekit's own plugin repo ships
-runnable examples in each plugin's README. Requires an Anakin API key
-available either as the Flyte secret ``group="anakin"``, ``key="api-key"``
-(see README.md for how to create it) or as an ``ANAKIN_API_KEY``
-environment variable when running locally with ``pyflyte run``.
+Run locally (no Flyte cluster needed). ``scrape_pages_wf`` and
+``wire_lookup_wf`` work without an API key on Anakin's free per-IP allowance:
 
-Run locally (no Flyte backend needed):
+    pyflyte run example_workflows/example_anakin.py scrape_pages_wf \\
+        --urls '["https://example.com", "https://anakin.io"]'
+    pyflyte run example_workflows/example_anakin.py wire_lookup_wf --q "search products on amazon"
 
-    ANAKIN_API_KEY=ask-... pyflyte run example_workflows/example_anakin.py \\
-        anakin_research_wf --topic "developments in AI agents"
+``research_wf`` needs a key (``ANAKIN_API_KEY`` locally, or the
+``anakin/api-key`` Flyte secret on a cluster):
 
-    ANAKIN_API_KEY=ask-... pyflyte run example_workflows/example_anakin.py \\
-        anakin_wire_and_monitoring_wf --website_url "https://example.com"
+    ANAKIN_API_KEY=ask_... pyflyte run example_workflows/example_anakin.py research_wf \\
+        --topic "web scraping APIs for AI agents"
+
+Add ``--remote`` to run on a cluster after creating the secret.
 """
 
 from __future__ import annotations
 
-from typing import Any
+import functools
 
-from flytekit import workflow
+from anakin.models import Document, SearchResult, WireActionMatch
+from flytekit import map_task, task, workflow
 
-from anakin.models import AgenticSearchResult, Document, SearchResult
 from flytekitplugins.anakin import (
     agentic_search,
-    ai_visibility_search,
-    monitor_create,
     scrape_url,
     search,
+    wire_catalog,
     wire_discover,
 )
 
 
-@workflow
-def anakin_research_wf(topic: str = "developments in AI agents") -> AgenticSearchResult:
-    """Scrape a reference page, run a quick search, then a deeper agentic
-    research pass — chained the way a real research pipeline would use
-    these three endpoints together."""
-    doc: Document = scrape_url(url="https://anakin.io/docs")
-    quick: SearchResult = search(prompt=topic, limit=5)
-    return agentic_search(prompt=topic, use_browser=True)
+@task
+def summarize_pages(docs: list[Document]) -> list[str]:
+    """Downstream tasks get typed `anakin.models` objects, not raw JSON."""
+    return [f"{doc.url}: {len(doc.markdown or '')} chars of markdown" for doc in docs]
+
+
+# map_task maps over `url` and needs every other input bound, defaults included.
+scrape_markdown = functools.partial(
+    scrape_url,
+    country="us",
+    use_browser=False,
+    generate_json=False,
+    output_schema=None,
+    formats=None,
+    force_fresh=False,
+    session_id=None,
+    session_name=None,
+    poll_timeout=None,
+)
 
 
 @workflow
-def anakin_wire_and_monitoring_wf(
-    website_url: str = "https://example.com",
-) -> dict[str, Any]:
-    """A second pipeline exercising the newer capability groups this
-    package added beyond the original scrape/search/agentic_search trio:
-    Wire action discovery, a scheduled website monitor, and an AI-visibility
-    brand check — three of the 12 raw-HTTP tasks (no anakin-sdk model
-    backs their output, so each returns a plain ``dict``).
-
-    Discovers candidate Wire actions for the site, creates a low-frequency
-    monitor watching it for changes, and asks multiple AI answer engines
-    what they say about it — independent steps, run for illustration rather
-    than because one feeds the next.
-    """
-    candidates: dict[str, Any] = wire_discover(q=f"extract data from {website_url}", limit=3)
-    monitor: dict[str, Any] = monitor_create(url=website_url, interval_minutes=60)
-    visibility: dict[str, Any] = ai_visibility_search(query=f"What is {website_url}?")
-    return {"wire_candidates": candidates, "monitor": monitor, "ai_visibility": visibility}
+def scrape_pages_wf(urls: list[str]) -> list[str]:
+    """Scrape many pages in parallel with Flyte's map_task, then post-process them."""
+    docs = map_task(scrape_markdown)(url=urls)
+    return summarize_pages(docs=docs)
 
 
-if __name__ == "__main__":
-    print(anakin_research_wf(topic="developments in AI agents"))
+@task
+def describe_matches(matches: list[WireActionMatch]) -> list[str]:
+    return [f"{m.action_id} ({m.mode}, {m.credits} credits)" for m in matches]
+
+
+@task
+def first_catalog(matches: list[WireActionMatch]) -> str:
+    return (matches[0].catalog_slug or "") if matches else ""
+
+
+@workflow
+def wire_lookup_wf(q: str) -> list[str]:
+    """Find pre-built Wire actions for a task described in plain language."""
+    matches = wire_discover(q=q, limit=3)
+    wire_catalog(slug=first_catalog(matches=matches))
+    return describe_matches(matches=matches)
+
+
+@task
+def to_brief(quick: SearchResult, page: Document) -> str:
+    sources = "\n".join(f"- {r.title}: {r.url}" for r in quick.results)
+    return f"Sources:\n{sources}\n\nFirst source, {len(page.markdown or '')} chars scraped."
+
+
+@task
+def top_url(quick: SearchResult) -> str:
+    return quick.results[0].url
+
+
+@workflow
+def research_wf(topic: str) -> str:
+    """Search the web, scrape the top hit, and run a deeper agentic research pass."""
+    quick = search(prompt=topic, limit=5)
+    page = scrape_url(url=top_url(quick=quick))
+    agentic_search(prompt=topic)
+    return to_brief(quick=quick, page=page)

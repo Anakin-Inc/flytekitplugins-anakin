@@ -1,44 +1,40 @@
-"""Unit tests for the Anakin flytekit tasks.
+"""Unit tests for the Anakin tasks.
 
-Two mocking strategies, matching the two implementation strategies in
-`tasks.py`:
-
-- SDK-backed tasks (`scrape_url`, `search`, `agentic_search`, `map_site`,
-  `crawl_site`, `wire_read_action`, `wire_write_action`, `session_list`,
-  `session_delete`) mock `flytekitplugins.anakin.tasks.Anakin` (the SDK
-  client class) entirely — these test the task <-> anakin-sdk wiring
-  (kwargs passed through, the SDK's return value returned as-is), not the
-  SDK or Flyte's runtime themselves.
-- Raw-HTTP tasks (the 12 endpoints anakin-sdk v0.1.0 doesn't implement) mock
-  `flytekitplugins.anakin.tasks._http.request`/`.poll` — these test the
-  task <-> REST wiring (method/path/body built correctly, response shaped
-  correctly), not `httpx` or the live API itself.
-
-Tasks are called directly, which is flytekit's own supported pattern for
-exercising `@task` functions without a running Flyte backend ("local
-execution" — see flytekit's testing docs). Requires `flytekit` and
-`anakin-sdk` installed to *run*; see SUBMIT.md for why that wasn't exercised
-in this environment.
+SDK-backed tasks get a mocked `anakin.Anakin` client that returns real
+`anakin.models` objects. Tasks are called the way a workflow calls them
+(keyword arguments, flytekit local execution), so every test also runs the
+inputs and outputs through flytekit's type engine. `browser_task` gets a fake
+`httpx.Client`.
 """
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from typing import Any
+from unittest.mock import MagicMock
 
+import pytest
 from anakin.models import (
+    AgenticSearchData,
     AgenticSearchResult,
+    AIVisibilitySearch,
+    AIVisibilitySource,
     BrowserSession,
     CrawlResult,
     Document,
     MapResult,
+    Monitor,
+    MonitorRun,
     SearchResult,
+    SearchResultItem,
+    WireActionMatch,
+    WireBuildRequest,
+    WireCatalog,
+    WireCatalogDetail,
+    WireLoginResult,
     WireResult,
 )
 
-from flytekitplugins.anakin.tasks import (
-    ANAKIN_SECRET_GROUP,
-    ANAKIN_SECRET_KEY,
-    DEFAULT_ANAKIN_BASE_URL,
+from flytekitplugins.anakin import (
     agentic_search,
     ai_visibility_search,
     ai_visibility_sources,
@@ -48,13 +44,16 @@ from flytekitplugins.anakin.tasks import (
     monitor_changes,
     monitor_control,
     monitor_create,
+    monitor_get,
     monitor_list,
     scrape_url,
     search,
     session_delete,
     session_list,
     wire_build,
+    wire_build_status,
     wire_catalog,
+    wire_catalogs,
     wire_discover,
     wire_identities,
     wire_login,
@@ -63,32 +62,40 @@ from flytekitplugins.anakin.tasks import (
 )
 
 
-def test_secret_group_and_key_and_base_url_defaults() -> None:
-    assert ANAKIN_SECRET_GROUP == "anakin"
-    assert ANAKIN_SECRET_KEY == "api-key"
-    assert DEFAULT_ANAKIN_BASE_URL == "https://api.anakin.io/v1"
+@pytest.fixture
+def client(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    mock = MagicMock()
+    monkeypatch.setattr("flytekitplugins.anakin.tasks._client", lambda: mock)
+    return mock
 
 
-def test_scrape_url_task_returns_document() -> None:
-    document = Document(
-        id="job_1",
-        url="https://example.com",
-        status="completed",
-        cached=False,
-        duration_ms=120,
-        markdown="# Hello",
+# ─── Scrape and search ──────────────────────────────────────────────────────
+
+
+def test_scrape_url(client: MagicMock) -> None:
+    client.scrape.return_value = Document.model_validate(
+        {
+            "id": "job_1",
+            "url": "https://example.com",
+            "status": "completed",
+            "markdown": "# Hello",
+            "generatedJson": {"title": "Hello", "price": None},
+            "createdAt": "2026-10-16T10:00:00Z",
+        }
     )
-    with patch("flytekitplugins.anakin.tasks.Anakin") as mock_anakin_cls:
-        mock_anakin_cls.return_value.scrape.return_value = document
-        result = scrape_url(url="https://example.com")
 
+    result = scrape_url(url="https://example.com", country="gb", use_browser=True)
+
+    assert isinstance(result, Document)
     assert result.markdown == "# Hello"
-    assert result.id == "job_1"
-    mock_anakin_cls.return_value.scrape.assert_called_once_with(
+    assert result.generated_json == {"title": "Hello", "price": None}
+    client.scrape.assert_called_once_with(
         "https://example.com",
-        country="us",
-        use_browser=False,
+        formats=("markdown",),
+        country="gb",
+        use_browser=True,
         generate_json=False,
+        output_schema=None,
         force_fresh=False,
         session_id=None,
         session_name=None,
@@ -96,427 +103,384 @@ def test_scrape_url_task_returns_document() -> None:
     )
 
 
-def test_search_task_returns_search_result() -> None:
-    search_result = SearchResult(id="job_2", results=[])
-    with patch("flytekitplugins.anakin.tasks.Anakin") as mock_anakin_cls:
-        mock_anakin_cls.return_value.search.return_value = search_result
-        result = search(prompt="latest AI agents", limit=3)
+def test_scrape_url_passes_schema_and_formats(client: MagicMock) -> None:
+    client.scrape.return_value = Document(id="j", status="completed")
+    schema = {"type": "object", "properties": {"price": {"type": ["number", "null"]}}}
 
-    assert result.id == "job_2"
-    assert result.results == []
-    mock_anakin_cls.return_value.search.assert_called_once_with(
-        "latest AI agents", limit=3
-    )
+    scrape_url(url="https://a.com", output_schema=schema, formats=["markdown", "links"])
+
+    kwargs = client.scrape.call_args.kwargs
+    assert kwargs["output_schema"] == schema
+    assert kwargs["formats"] == ("markdown", "links")
 
 
-def test_agentic_search_task_returns_agentic_search_result() -> None:
-    agentic_result = AgenticSearchResult(id="job_3", status="completed")
-    with patch("flytekitplugins.anakin.tasks.Anakin") as mock_anakin_cls:
-        mock_anakin_cls.return_value.agentic_search.return_value = agentic_result
-        result = agentic_search(prompt="compare CRMs")
+def test_map_site(client: MagicMock) -> None:
+    client.map.return_value = MapResult(id="m1", links=["https://a.com/x"], total_links=1)
 
-    assert result.id == "job_3"
-    assert result.status == "completed"
-    mock_anakin_cls.return_value.agentic_search.assert_called_once_with(
-        "compare CRMs", use_browser=True, schema=None, poll_timeout=None
-    )
+    result = map_site(url="https://a.com", depth=1, search="x")
+
+    assert result.links == ["https://a.com/x"]
+    assert client.map.call_args.kwargs["depth"] == 1
+    assert client.map.call_args.kwargs["search"] == "x"
 
 
-def test_agentic_search_default_use_browser_is_true() -> None:
-    """agentic_search defaults use_browser=True (opposite of scrape_url's
-    False default) — per anakin-py/src/anakin/client.py, preserved here
-    rather than flattened to one default across both tasks."""
-    agentic_result = AgenticSearchResult(id="job_4", status="completed")
-    with patch("flytekitplugins.anakin.tasks.Anakin") as mock_anakin_cls:
-        mock_anakin_cls.return_value.agentic_search.return_value = agentic_result
-        agentic_search(prompt="compare CRMs")
-
-    _, kwargs = mock_anakin_cls.return_value.agentic_search.call_args
-    assert kwargs["use_browser"] is True
-
-
-# ─── SDK-backed: map_site, crawl_site, wire_read_action, wire_write_action,
-# session_list, session_delete ───────────────────────────────────────────────
-
-
-def test_map_site_task_returns_map_result() -> None:
-    map_result = MapResult(id="job_5", url="https://example.com", links=["https://example.com/a"])
-    with patch("flytekitplugins.anakin.tasks.Anakin") as mock_anakin_cls:
-        mock_anakin_cls.return_value.map.return_value = map_result
-        result = map_site(url="https://example.com", depth=3)
-
-    assert result.id == "job_5"
-    assert result.links == ["https://example.com/a"]
-    mock_anakin_cls.return_value.map.assert_called_once_with(
-        "https://example.com",
-        limit=100,
-        depth=3,
-        limit_per_level=100,
-        include_subdomains=False,
-        include_external_links=False,
-        search=None,
-        use_browser=False,
-        session_id=None,
-        poll_timeout=None,
-    )
-
-
-def test_crawl_site_task_returns_crawl_result() -> None:
-    crawl_result = CrawlResult(id="job_6", url="https://example.com", total_pages=2)
-    with patch("flytekitplugins.anakin.tasks.Anakin") as mock_anakin_cls:
-        mock_anakin_cls.return_value.crawl.return_value = crawl_result
-        result = crawl_site(url="https://example.com", max_pages=5)
-
-    assert result.id == "job_6"
-    assert result.total_pages == 2
-    mock_anakin_cls.return_value.crawl.assert_called_once_with(
-        "https://example.com",
-        max_pages=5,
-        depth=1,
-        include_patterns=(),
-        exclude_patterns=(),
-        country="us",
-        use_browser=False,
-        session_id=None,
-        poll_timeout=None,
-    )
-
-
-def test_wire_read_action_task_returns_wire_result() -> None:
-    wire_result = WireResult(job_id="job_7", status="completed", data={"price": 10})
-    with patch("flytekitplugins.anakin.tasks.Anakin") as mock_anakin_cls:
-        mock_anakin_cls.return_value.wire.return_value = wire_result
-        result = wire_read_action(action_id="walmart.get_product", params={"url": "https://x"})
-
-    assert result.job_id == "job_7"
-    assert result.data == {"price": 10}
-    mock_anakin_cls.return_value.wire.assert_called_once_with(
-        "walmart.get_product", {"url": "https://x"}, poll_timeout=None
-    )
-
-
-def test_wire_write_action_task_returns_wire_result() -> None:
-    wire_result = WireResult(job_id="job_8", status="completed")
-    with patch("flytekitplugins.anakin.tasks.Anakin") as mock_anakin_cls:
-        mock_anakin_cls.return_value.wire.return_value = wire_result
-        result = wire_write_action(action_id="neb.submit_form")
-
-    assert result.job_id == "job_8"
-    mock_anakin_cls.return_value.wire.assert_called_once_with(
-        "neb.submit_form", {}, poll_timeout=None
-    )
-
-
-def test_session_list_task_returns_sessions() -> None:
-    session = BrowserSession(sessionId="sess_1", name="my session", isActive=True)
-    with patch("flytekitplugins.anakin.tasks.Anakin") as mock_anakin_cls:
-        mock_anakin_cls.return_value.sessions.list.return_value = [session]
-        result = session_list(domain="amazon.com")
-
-    assert result == [session]
-    mock_anakin_cls.return_value.sessions.list.assert_called_once_with(domain="amazon.com")
-
-
-def test_session_delete_task_calls_sdk_delete() -> None:
-    with patch("flytekitplugins.anakin.tasks.Anakin") as mock_anakin_cls:
-        session_delete(session_id="sess_1")
-
-    mock_anakin_cls.return_value.sessions.delete.assert_called_once_with("sess_1")
-
-
-# ─── Raw HTTP: wire discovery/catalog/identities/login/build ───────────────
-
-
-def test_wire_discover_task_calls_wire_resolve() -> None:
-    with patch("flytekitplugins.anakin.tasks._resolve_api_key", return_value="ak-test"), patch(
-        "flytekitplugins.anakin.tasks._http.request"
-    ) as mock_request:
-        mock_request.return_value = {"results": [{"action_id": "walmart.search"}]}
-        result = wire_discover(q="top phones on walmart", limit=3)
-
-    assert result == {"results": [{"action_id": "walmart.search"}]}
-    mock_request.assert_called_once_with(
-        "GET",
-        "/wire/resolve",
-        api_key="ak-test",
-        base_url=DEFAULT_ANAKIN_BASE_URL,
-        params={"q": "top phones on walmart", "limit": 3},
-    )
-
-
-def test_wire_catalog_task_with_slug() -> None:
-    with patch("flytekitplugins.anakin.tasks._resolve_api_key", return_value="ak-test"), patch(
-        "flytekitplugins.anakin.tasks._http.request"
-    ) as mock_request:
-        mock_request.return_value = {"slug": "walmart", "actions": []}
-        result = wire_catalog(slug="walmart")
-
-    assert result == {"slug": "walmart", "actions": []}
-    mock_request.assert_called_once_with(
-        "GET", "/wire/catalog/walmart", api_key="ak-test", base_url=DEFAULT_ANAKIN_BASE_URL
-    )
-
-
-def test_wire_catalog_task_without_slug_lists_all() -> None:
-    with patch("flytekitplugins.anakin.tasks._resolve_api_key", return_value="ak-test"), patch(
-        "flytekitplugins.anakin.tasks._http.request"
-    ) as mock_request:
-        mock_request.return_value = {"catalogs": []}
-        wire_catalog()
-
-    mock_request.assert_called_once_with(
-        "GET", "/wire/catalog", api_key="ak-test", base_url=DEFAULT_ANAKIN_BASE_URL
-    )
-
-
-def test_wire_identities_task() -> None:
-    with patch("flytekitplugins.anakin.tasks._resolve_api_key", return_value="ak-test"), patch(
-        "flytekitplugins.anakin.tasks._http.request"
-    ) as mock_request:
-        mock_request.return_value = {"identities": []}
-        result = wire_identities(catalog_id="walmart")
-
-    assert result == {"identities": []}
-    mock_request.assert_called_once_with(
-        "GET",
-        "/wire/identities",
-        api_key="ak-test",
-        base_url=DEFAULT_ANAKIN_BASE_URL,
-        params={"catalog_id": "walmart"},
-    )
-
-
-def test_wire_login_task_builds_body() -> None:
-    with patch("flytekitplugins.anakin.tasks._resolve_api_key", return_value="ak-test"), patch(
-        "flytekitplugins.anakin.tasks._http.request"
-    ) as mock_request:
-        mock_request.return_value = {"credential_id": "cred_1"}
-        result = wire_login(
-            catalog_slug="neb", params={"email": "a@b.com", "password": "secret"}
-        )
-
-    assert result == {"credential_id": "cred_1"}
-    mock_request.assert_called_once_with(
-        "POST",
-        "/wire/login",
-        api_key="ak-test",
-        base_url=DEFAULT_ANAKIN_BASE_URL,
-        json={
-            "catalog_slug": "neb",
-            "params": {"email": "a@b.com", "password": "secret"},
-        },
-    )
-
-
-def test_wire_build_task_builds_body() -> None:
-    with patch("flytekitplugins.anakin.tasks._resolve_api_key", return_value="ak-test"), patch(
-        "flytekitplugins.anakin.tasks._http.request"
-    ) as mock_request:
-        mock_request.return_value = {"status": "pending"}
-        result = wire_build(website_url="https://newsite.com", goal="extract prices")
-
-    assert result == {"status": "pending"}
-    mock_request.assert_called_once_with(
-        "POST",
-        "/wire/build-request",
-        api_key="ak-test",
-        base_url=DEFAULT_ANAKIN_BASE_URL,
-        json={
-            "website_url": "https://newsite.com",
-            "goal": "extract prices",
-            "visibility": "private",
-            "force": False,
-        },
-    )
-
-
-# ─── Raw HTTP: monitors ─────────────────────────────────────────────────────
-
-
-def test_monitor_create_task_redacts_webhook_secret() -> None:
-    with patch("flytekitplugins.anakin.tasks._resolve_api_key", return_value="ak-test"), patch(
-        "flytekitplugins.anakin.tasks._http.request"
-    ) as mock_request:
-        mock_request.return_value = {
-            "id": "mon_1",
-            "url": "https://example.com",
-            "alertWebhookSecret": "whsec_super_secret",
+def test_crawl_site(client: MagicMock) -> None:
+    client.crawl.return_value = CrawlResult.model_validate(
+        {
+            "id": "c1",
+            "totalPages": 1,
+            "completedPages": 1,
+            "results": [{"url": "u", "status": "completed", "markdown": "m"}],
         }
-        result = monitor_create(url="https://example.com", interval_minutes=30)
+    )
 
+    result = crawl_site(url="https://a.com", include_patterns=["/blog/*"])
+
+    assert result.pages[0].markdown == "m"
+    assert client.crawl.call_args.kwargs["include_patterns"] == ["/blog/*"]
+    assert client.crawl.call_args.kwargs["exclude_patterns"] == ()
+
+
+def test_search(client: MagicMock) -> None:
+    client.search.return_value = SearchResult(
+        id="s1", results=[SearchResultItem(url="https://example.com", title="Example")]
+    )
+
+    result = search(prompt="what is anakin", limit=3)
+
+    assert result.results[0].url == "https://example.com"
+    client.search.assert_called_once_with("what is anakin", limit=3)
+
+
+def test_agentic_search(client: MagicMock) -> None:
+    client.agentic_search.return_value = AgenticSearchResult(
+        id="a1", status="completed", generated_json=AgenticSearchData(summary="done")
+    )
+
+    result = agentic_search(prompt="research x", schema={"type": "object"})
+
+    assert result.generated_json is not None
+    assert result.generated_json.summary == "done"
+    client.agentic_search.assert_called_once_with(
+        "research x", use_browser=True, schema={"type": "object"}, poll_timeout=None
+    )
+
+
+# ─── Wire ───────────────────────────────────────────────────────────────────
+
+
+def test_wire_discover(client: MagicMock) -> None:
+    client.wire.discover.return_value = [WireActionMatch(action_id="amazon.search", mode="read")]
+
+    result = wire_discover(q="search amazon", limit=3)
+
+    assert result[0].action_id == "amazon.search"
+    client.wire.discover.assert_called_once_with("search amazon", catalog=None, limit=3)
+
+
+def test_wire_catalogs(client: MagicMock) -> None:
+    client.wire.catalogs.return_value = [WireCatalog(id="c1", slug="amazon", name="Amazon")]
+
+    result = wire_catalogs()
+
+    assert result[0].slug == "amazon"
+
+
+def test_wire_catalog(client: MagicMock) -> None:
+    client.wire.catalog.return_value = WireCatalogDetail.model_validate(
+        {
+            "catalog": {"id": "c1", "slug": "amazon", "name": "Amazon"},
+            "actions": [],
+            "login_input_schema": [{"name": "email", "default": None}],
+        }
+    )
+
+    result = wire_catalog(slug="amazon")
+
+    assert result.catalog.slug == "amazon"
+    assert result.login_input_schema == [{"name": "email", "default": None}]
+    client.wire.catalog.assert_called_once_with("amazon")
+
+
+def test_wire_read_action_passes_credential(client: MagicMock) -> None:
+    client.wire.run.return_value = WireResult(
+        job_id="j1", status="completed", data={"price": 9, "sale": None}
+    )
+
+    result = wire_read_action(
+        action_id="amazon.get_product", params={"asin": "B0"}, credential_id="cred_1"
+    )
+
+    assert result.data == {"price": 9, "sale": None}
+    client.wire.run.assert_called_once_with(
+        "amazon.get_product",
+        {"asin": "B0"},
+        credential_id="cred_1",
+        identity_id=None,
+        poll_timeout=None,
+    )
+
+
+def test_wire_read_action_defaults_params(client: MagicMock) -> None:
+    client.wire.run.return_value = WireResult(status="completed")
+
+    wire_read_action(action_id="x.list")
+
+    assert client.wire.run.call_args.args == ("x.list", {})
+
+
+def test_wire_write_action_runs_benign_action(client: MagicMock) -> None:
+    client.wire.run.return_value = WireResult(status="completed")
+
+    wire_write_action(action_id="shop.add_to_cart", params={"sku": "1"})
+
+    client.wire.run.assert_called_once()
+
+
+def test_wire_write_action_refuses_payment(client: MagicMock) -> None:
+    with pytest.raises(Exception, match="payments or fund transfers"):
+        wire_write_action(action_id="shop.checkout")
+    client.wire.run.assert_not_called()
+
+
+def test_wire_identities(client: MagicMock) -> None:
+    client.wire.identities.return_value = []
+
+    assert wire_identities(catalog_id="cat_1") == []
+    client.wire.identities.assert_called_once_with(catalog_id="cat_1")
+
+
+def test_wire_login(client: MagicMock) -> None:
+    client.wire.login.return_value = WireLoginResult(
+        status="ok", identity_id="i1", credential_id="cred_1"
+    )
+
+    result = wire_login(catalog_slug="neb", params={"email": "a@b.c", "password": "x"})
+
+    assert result.credential_id == "cred_1"
+    client.wire.login.assert_called_once_with(
+        "neb",
+        {"email": "a@b.c", "password": "x"},
+        identity_name=None,
+        source_id=None,
+        source_ref=None,
+    )
+
+
+def test_wire_build(client: MagicMock) -> None:
+    client.wire.build.return_value = WireBuildRequest(id="b1", status="pending")
+
+    result = wire_build(website_url="https://example.com", goal="list products")
+
+    assert result.status == "pending"
+    client.wire.build.assert_called_once_with(
+        "https://example.com", "list products", catalog_id=None, visibility="private", force=False
+    )
+
+
+def test_wire_build_refuses_payment(client: MagicMock) -> None:
+    with pytest.raises(Exception, match="payments or fund transfers"):
+        wire_build(website_url="https://shop.com", goal="pay now for the order")
+    client.wire.build.assert_not_called()
+
+
+def test_wire_build_status(client: MagicMock) -> None:
+    client.wire.get_build.return_value = WireBuildRequest(id="b1", status="success")
+
+    assert wire_build_status(build_id="b1").status == "success"
+
+
+# ─── Monitors ───────────────────────────────────────────────────────────────
+
+
+def _monitor(**extra: Any) -> Monitor:
+    return Monitor.model_validate(
+        {"id": "mon_1", "url": "https://a.com", "createdAt": "2026-10-28T10:00:00Z", **extra}
+    )
+
+
+def test_monitor_create_maps_options_and_redacts_secret(client: MagicMock) -> None:
+    client.monitors.create.return_value = _monitor(alertWebhookSecret="whsec_live")
+
+    result = monitor_create(
+        url="https://a.com", interval_minutes=60, ai_mode=True, alert_webhook_url="https://hook"
+    )
+
+    assert result.id == "mon_1"
+    assert result.alert_webhook_secret is not None
+    assert result.alert_webhook_secret.startswith("[redacted")
+    assert "whsec_live" not in result.model_dump_json()
+    args, kwargs = client.monitors.create.call_args
+    assert args == ("https://a.com", 60)
+    assert kwargs["ai_mode"] is True
+    assert kwargs["alert_webhook_url"] == "https://hook"
+    assert "output_schema" not in kwargs
+
+
+def test_monitor_list_and_get_redact(client: MagicMock) -> None:
+    client.monitors.get.return_value = _monitor(alertWebhookSecret="s")
+    client.monitors.list.return_value = [_monitor(alertWebhookSecret="s"), _monitor()]
+
+    one = monitor_get(monitor_id="mon_1")
+    many = monitor_list()
+
+    assert one.alert_webhook_secret is not None
+    assert one.alert_webhook_secret.startswith("[redacted")
+    assert many[0].alert_webhook_secret is not None
+    assert many[0].alert_webhook_secret.startswith("[redacted")
+    assert many[1].alert_webhook_secret is None
+
+
+def test_monitor_changes(client: MagicMock) -> None:
+    client.monitors.changes.return_value = []
+
+    assert monitor_changes(monitor_id="mon_1") == []
+    client.monitors.changes.assert_called_once_with("mon_1")
+
+
+@pytest.mark.parametrize("action", ["pause", "resume"])
+def test_monitor_control_pause_resume(client: MagicMock, action: str) -> None:
+    getattr(client.monitors, action).return_value = _monitor(alertWebhookSecret="s")
+
+    result = monitor_control(monitor_id="mon_1", action=action)
+
+    assert result is not None
     assert result["id"] == "mon_1"
-    assert result["alertWebhookSecret"] == "[redacted — view in the Anakin dashboard]"
-    _, kwargs = mock_request.call_args
-    assert kwargs["json"] == {
-        "url": "https://example.com",
-        "intervalMinutes": 30,
-        "scope": "page",
-        "watchMode": "full_page",
-        "watchFormat": "markdown",
-        "aiMode": False,
-        "useBrowser": False,
-        "country": "us",
-        "isActive": True,
-    }
+    assert result["alert_webhook_secret"].startswith("[redacted")
+    getattr(client.monitors, action).assert_called_once_with("mon_1")
 
 
-def test_monitor_list_task_with_id_fetches_single_monitor() -> None:
-    with patch("flytekitplugins.anakin.tasks._resolve_api_key", return_value="ak-test"), patch(
-        "flytekitplugins.anakin.tasks._http.request"
-    ) as mock_request:
-        mock_request.return_value = {"id": "mon_1"}
-        result = monitor_list(monitor_id="mon_1")
+def test_monitor_control_run_now(client: MagicMock) -> None:
+    client.monitors.run_now.return_value = MonitorRun(success=True, job_id="j1")
 
-    assert result == {"id": "mon_1"}
-    mock_request.assert_called_once_with(
-        "GET", "/monitors/mon_1", api_key="ak-test", base_url=DEFAULT_ANAKIN_BASE_URL
-    )
+    result = monitor_control(monitor_id="mon_1", action="run_now")
+
+    assert result == {"success": True, "job_id": "j1", "message": None}
 
 
-def test_monitor_changes_task() -> None:
-    with patch("flytekitplugins.anakin.tasks._resolve_api_key", return_value="ak-test"), patch(
-        "flytekitplugins.anakin.tasks._http.request"
-    ) as mock_request:
-        mock_request.return_value = {"changes": []}
-        result = monitor_changes(monitor_id="mon_1")
-
-    assert result == {"changes": []}
-    mock_request.assert_called_once_with(
-        "GET", "/monitors/mon_1/changes", api_key="ak-test", base_url=DEFAULT_ANAKIN_BASE_URL
-    )
+def test_monitor_control_delete(client: MagicMock) -> None:
+    assert monitor_control(monitor_id="mon_1", action="delete") is None
+    client.monitors.delete.assert_called_once_with("mon_1")
 
 
-def test_monitor_control_run_now_maps_to_run_path() -> None:
-    with patch("flytekitplugins.anakin.tasks._resolve_api_key", return_value="ak-test"), patch(
-        "flytekitplugins.anakin.tasks._http.request"
-    ) as mock_request:
-        mock_request.return_value = {"id": "mon_1", "status": "running"}
-        monitor_control(monitor_id="mon_1", action="run_now")
-
-    mock_request.assert_called_once_with(
-        "POST", "/monitors/mon_1/run", api_key="ak-test", base_url=DEFAULT_ANAKIN_BASE_URL
-    )
+def test_monitor_control_rejects_unknown_action(client: MagicMock) -> None:
+    with pytest.raises(Exception, match="Unknown monitor action"):
+        monitor_control(monitor_id="mon_1", action="explode")
 
 
-def test_monitor_control_delete_uses_delete_verb() -> None:
-    with patch("flytekitplugins.anakin.tasks._resolve_api_key", return_value="ak-test"), patch(
-        "flytekitplugins.anakin.tasks._http.request"
-    ) as mock_request:
-        mock_request.return_value = {}
-        monitor_control(monitor_id="mon_1", action="delete")
-
-    mock_request.assert_called_once_with(
-        "DELETE", "/monitors/mon_1", api_key="ak-test", base_url=DEFAULT_ANAKIN_BASE_URL
-    )
+# ─── AI visibility ──────────────────────────────────────────────────────────
 
 
-# ─── Raw HTTP: AI visibility ────────────────────────────────────────────────
+def test_ai_visibility_sources(client: MagicMock) -> None:
+    client.ai_visibility.sources.return_value = [
+        AIVisibilitySource.model_validate({"slug": "chatgpt", "label": "ChatGPT"})
+    ]
+
+    assert ai_visibility_sources()[0].slug == "chatgpt"
 
 
-def test_ai_visibility_sources_task() -> None:
-    with patch("flytekitplugins.anakin.tasks._resolve_api_key", return_value="ak-test"), patch(
-        "flytekitplugins.anakin.tasks._http.request"
-    ) as mock_request:
-        mock_request.return_value = {"sources": [{"slug": "chatgpt"}]}
-        result = ai_visibility_sources()
-
-    assert result == {"sources": [{"slug": "chatgpt"}]}
-    mock_request.assert_called_once_with(
-        "GET", "/ai-visibility/sources", api_key="ak-test", base_url=DEFAULT_ANAKIN_BASE_URL
-    )
-
-
-def test_ai_visibility_search_task_strips_full_content_by_default() -> None:
-    with patch("flytekitplugins.anakin.tasks._resolve_api_key", return_value="ak-test"), patch(
-        "flytekitplugins.anakin.tasks._http.request"
-    ) as mock_request:
-        mock_request.return_value = {
-            "search_id": "srch_1",
+def _visibility_result() -> AIVisibilitySearch:
+    return AIVisibilitySearch.model_validate(
+        {
+            "search_id": "v1",
             "status": "completed",
-            "country": "us",
-            "synthesis": "Both engines agree.",
-            "results": [{"source": "chatgpt", "summary": "...", "full_content": "huge text"}],
+            "results": [{"source": "chatgpt", "status": "completed", "full_content": "long"}],
         }
-        result = ai_visibility_search(query="what is Anakin?")
-
-    assert result["search_id"] == "srch_1"
-    assert result["results"] == [{"source": "chatgpt", "summary": "..."}]
-    mock_request.assert_called_once_with(
-        "POST",
-        "/ai-visibility/search",
-        api_key="ak-test",
-        base_url=DEFAULT_ANAKIN_BASE_URL,
-        json={"query": "what is Anakin?", "country": "us"},
     )
 
 
-def test_ai_visibility_search_task_polls_when_still_running() -> None:
-    with patch("flytekitplugins.anakin.tasks._resolve_api_key", return_value="ak-test"), patch(
-        "flytekitplugins.anakin.tasks._http.request"
-    ) as mock_request, patch("flytekitplugins.anakin.tasks._http.poll") as mock_poll:
-        mock_request.return_value = {"search_id": "srch_2", "status": "running"}
-        mock_poll.return_value = {
-            "search_id": "srch_2",
+def test_ai_visibility_search_strips_full_content(client: MagicMock) -> None:
+    client.ai_visibility.search.return_value = _visibility_result()
+
+    result = ai_visibility_search(query="best scraping api", sources=["chatgpt"])
+
+    assert result.results[0].full_content is None
+    client.ai_visibility.search.assert_called_once_with(
+        "best scraping api", sources=["chatgpt"], country="us", poll_timeout=None
+    )
+
+
+def test_ai_visibility_search_keeps_full_content(client: MagicMock) -> None:
+    client.ai_visibility.search.return_value = _visibility_result()
+
+    result = ai_visibility_search(query="q", include_full_content=True)
+
+    assert result.results[0].full_content == "long"
+
+
+# ─── Sessions and browser tasks ─────────────────────────────────────────────
+
+
+def test_session_list(client: MagicMock) -> None:
+    client.sessions.list.return_value = [BrowserSession.model_validate({"id": "s1", "name": "amz"})]
+
+    result = session_list(domain="amazon.com")
+
+    assert result[0].id == "s1"
+    client.sessions.list.assert_called_once_with(domain="amazon.com")
+
+
+def test_session_delete(client: MagicMock) -> None:
+    session_delete(session_id="s1")
+    client.sessions.delete.assert_called_once_with("s1")
+
+
+def _fake_http(*bodies: Any) -> MagicMock:
+    http = MagicMock()
+    http.__enter__.return_value = http
+    http.__exit__.return_value = False
+    responses = []
+    for body in bodies:
+        response = MagicMock(is_error=False, content=b"x")
+        response.json.return_value = body
+        responses.append(response)
+    http.request.side_effect = responses
+    return http
+
+
+def test_browser_task_polls_until_complete(monkeypatch: pytest.MonkeyPatch) -> None:
+    http = _fake_http(
+        {"workflow_id": "wf_1"},
+        {"status": "running"},
+        {
             "status": "completed",
-            "results": [],
-        }
-        result = ai_visibility_search(query="what is Anakin?", include_full_content=True)
+            "result": {"success": True, "result": {"x": 1, "y": None}, "run_id": "r1"},
+        },
+    )
+    monkeypatch.setattr("flytekitplugins.anakin.tasks._http_client", lambda: http)
+    monkeypatch.setattr("flytekitplugins.anakin._http.time.sleep", lambda _s: None)
 
-    assert result["status"] == "completed"
-    mock_poll.assert_called_once()
-    args, kwargs = mock_poll.call_args
-    assert args[0] == "/ai-visibility/search/srch_2"
-    assert kwargs["poll_timeout"] == 180.0  # _http.DEFAULT_POLL_TIMEOUT
-
-
-# ─── Raw HTTP: browser_task ─────────────────────────────────────────────────
-
-
-def test_browser_task_polls_workflow_and_shapes_result() -> None:
-    with patch("flytekitplugins.anakin.tasks._resolve_api_key", return_value="ak-test"), patch(
-        "flytekitplugins.anakin.tasks._http.request"
-    ) as mock_request, patch("flytekitplugins.anakin.tasks._http.poll") as mock_poll:
-        mock_request.return_value = {"workflow_id": "wf_1", "status": "running"}
-        mock_poll.return_value = {
-            "status": "completed",
-            "result": {
-                "success": True,
-                "result": {"price": "$499"},
-                "steps": [1, 2, 3],
-                "iterations": 3,
-                "cached": False,
-                "duration_ms": 4200,
-                "run_id": "run_1",
-            },
-        }
-        result = browser_task(prompt="find the price", url="https://example.com")
+    result = browser_task(prompt="find the cheapest TV", url="https://shop.com", max_steps=5)
 
     assert result["success"] is True
-    assert result["steps_taken"] == 3
-    assert result["run_id"] == "run_1"
-    mock_request.assert_called_once_with(
-        "POST",
-        "/ai/evaluate",
-        api_key="ak-test",
-        base_url=DEFAULT_ANAKIN_BASE_URL,
-        json={"prompt": "find the price", "async": True, "url": "https://example.com"},
-    )
-    mock_poll.assert_called_once()
-    args, kwargs = mock_poll.call_args
-    assert args[0] == "/ai/jobs/wf_1"
-    assert kwargs["poll_timeout"] == 360.0  # _http.BROWSER_TASK_POLL_TIMEOUT
+    assert result["result"] == {"x": 1, "y": None}
+    assert result["run_id"] == "r1"
+    method, path = http.request.call_args_list[0].args
+    assert (method, path) == ("POST", "/ai/evaluate")
+    assert http.request.call_args_list[0].kwargs["json"] == {
+        "prompt": "find the cheapest TV",
+        "async": True,
+        "url": "https://shop.com",
+        "max_steps": 5,
+    }
+    assert http.request.call_args_list[1].args == ("GET", "/ai/jobs/wf_1")
 
 
-def test_browser_task_raises_on_failed_status() -> None:
-    with patch("flytekitplugins.anakin.tasks._resolve_api_key", return_value="ak-test"), patch(
-        "flytekitplugins.anakin.tasks._http.request"
-    ) as mock_request, patch("flytekitplugins.anakin.tasks._http.poll") as mock_poll:
-        mock_request.return_value = {"workflow_id": "wf_2", "status": "running"}
-        mock_poll.return_value = {"status": "failed", "error": "site blocked the agent"}
+def test_browser_task_raises_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    http = _fake_http({"workflow_id": "wf_1"}, {"status": "failed", "error": "site unreachable"})
+    monkeypatch.setattr("flytekitplugins.anakin.tasks._http_client", lambda: http)
 
-        try:
-            browser_task(prompt="do the impossible")
-        except Exception as exc:  # noqa: BLE001 — asserting the raised type below
-            assert "Browser task failed" in str(exc)
-        else:
-            raise AssertionError("expected browser_task to raise on a failed job")
+    with pytest.raises(Exception, match="site unreachable"):
+        browser_task(prompt="do something")
+
+
+def test_browser_task_refuses_payment() -> None:
+    with pytest.raises(Exception, match="payments or fund transfers"):
+        browser_task(prompt="checkout and buy now")
+
+
+def test_browser_task_needs_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ANAKIN_API_KEY", raising=False)
+
+    with pytest.raises(Exception, match="needs an Anakin API key"):
+        browser_task(prompt="read the headline")

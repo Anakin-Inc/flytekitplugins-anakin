@@ -4,9 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flytekitplugins-anakin"
-version = "0.1.0"
-description = "Flyte tasks for Anakin — web scraping, AI search, and agentic research"
+dynamic = ["version"]
+description = "Flyte tasks for Anakin: scrape, crawl, search, Wire site actions, website monitors and AI browser tasks"
 license = { text = "Apache-2.0" }
+authors = [{ name = "Anakin", email = "support@anakin.io" }]
+keywords = ["flyte", "flytekit", "flytekitplugins", "anakin", "web-scraping", "crawler", "web-data"]
 readme = "README.md"
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -18,59 +20,72 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
     "Topic :: Scientific/Engineering",
-    "Topic :: Software Development :: Libraries",
+    "Topic :: System :: Distributed Computing",
 ]
 requires-python = ">=3.10,<4.0"
 dependencies = [
-    # >=1.14 is required for native Pydantic v2 BaseModel task I/O support
-    # (MessagePack-encoded), which these tasks rely on to return
-    # anakin-sdk's Document/SearchResult/AgenticSearchResult models
-    # directly instead of flattening them to dicts. Confirmed via
-    # flyteorg/flyte's Pydantic BaseModel docs, not assumed.
+    # 1.14 added native Pydantic v2 task I/O, which the tasks' outputs rely on.
     "flytekit>=1.14.0,<2.0.0",
-    "anakin-sdk>=0.1.0,<0.2.0",
-    # Used directly by flytekitplugins/anakin/_http.py for the endpoints
-    # anakin-sdk v0.1.0 doesn't implement yet (Wire discovery/catalog/
-    # identities/login/build, monitors, AI visibility, browser_task) — same
-    # HTTP library anakin-sdk itself uses internally, so no new transport
-    # dependency is introduced, just a direct one instead of transitive.
-    "httpx>=0.27.0,<1.0.0",
+    "anakin-sdk>=0.2.0,<0.3.0",
+    # Only browser_task calls the API directly (POST /ai/evaluate isn't in
+    # anakin-sdk yet); same floor anakin-sdk pins.
+    "httpx>=0.27.0",
 ]
-
-# NOTE: no `entry_points = {"flytekit.plugins": ...}` here. Per
-# flyteorg/flytekit's plugins/README.md, that hook is optional and meant for
-# plugins that must auto-register a side effect at import time (type
-# transformers, data-persistence backends). These are plain `@task`
-# functions with no such side effect — users import them explicitly
-# (`from flytekitplugins.anakin import scrape_url`), same as any other
-# Python function. See SUBMIT.md for the full research trail.
 
 [project.urls]
 Homepage = "https://anakin.io"
-Documentation = "https://anakin.io/docs"
+Documentation = "https://anakin.io/docs/integrations/workflow/flyte"
 Repository = "https://github.com/Anakin-Inc/flytekitplugins-anakin"
 Issues = "https://github.com/Anakin-Inc/flytekitplugins-anakin/issues"
+Changelog = "https://github.com/Anakin-Inc/flytekitplugins-anakin/blob/main/CHANGELOG.md"
+
+# No `flytekit.plugins` entry point: that hook is for plugins that register a
+# type transformer or backend at import time. These tasks are imported
+# explicitly, like any other task.
 
 [dependency-groups]
 test = [
     "pytest>=8.0.0,<9.0.0",
-    "pytest-mock>=3.10.0,<4.0.0",
 ]
-typing = [
+lint = [
+    "ruff>=0.6",
     "mypy>=1.10.0,<2.0.0",
 ]
+
+[tool.hatch.version]
+path = "flytekitplugins/anakin/_version.py"
+
+# `flytekitplugins` is a PEP 420 namespace package shared with every other
+# flytekit plugin: no __init__.py at that level.
+[tool.hatch.build.targets.wheel]
+packages = ["flytekitplugins"]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["/.github", "/SUBMIT.md"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "RUF"]
+ignore = ["RUF001", "RUF002", "RUF003"]
+# Task signatures use typing.Optional, as in flytekit's own docs and plugins.
+extend-ignore = ["UP007", "UP045"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["flytekitplugins"]
+known-third-party = ["anakin"]
 
 [tool.pytest.ini_options]
 addopts = "--strict-markers --strict-config"
 
 [tool.mypy]
 disallow_untyped_defs = true
+namespace_packages = true
+explicit_package_bases = true
 
-# `flytekitplugins` is a namespace package (PEP 420 — no `__init__.py` at
-# this level, only under `flytekitplugins/anakin/`), per flyteorg/flytekit's
-# own plugin-authoring convention. hatchling includes it as a plain
-# directory tree; no `namespace_packages=` declaration needed the way
-# legacy setuptools required.
-[tool.hatch.build.targets.wheel]
-packages = ["flytekitplugins"]
+[[tool.mypy.overrides]]
+module = ["flytekit", "flytekit.*"]
+follow_untyped_imports = true

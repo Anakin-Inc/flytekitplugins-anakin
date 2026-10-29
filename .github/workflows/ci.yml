@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint and type check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          uv venv
+          uv pip install -e . --group test --group lint
+      - run: uv run --no-sync ruff check .
+      - run: uv run --no-sync ruff format --check flytekitplugins tests example_workflows
+      - run: uv run --no-sync mypy flytekitplugins
+
+  test:
+    name: flytekit ${{ matrix.flytekit }} / Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 1.14 is the floor: it added native Pydantic v2 task I/O.
+          - { flytekit: "1.14.*", python: "3.10" }
+          - { flytekit: "1.*", python: "3.10" }
+          - { flytekit: "1.*", python: "3.13" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: |
+          uv venv
+          uv pip install -e . --group test "flytekit==${{ matrix.flytekit }}"
+      - run: uv run --no-sync pytest
+      - name: Keyless example workflow against the live API
+        # Shared runner IPs can exhaust the keyless per-IP allowance.
+        continue-on-error: true
+        run: |
+          uv run --no-sync pyflyte run example_workflows/example_anakin.py scrape_pages_wf \
+            --urls '["https://example.com"]'
+
+  build:
+    name: Build and install
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv build --out-dir dist
+      - run: uvx twine check --strict dist/*
+      - name: Install the wheel
+        run: |
+          uv venv /tmp/smoke
+          uv pip install --python /tmp/smoke dist/*.whl
+          /tmp/smoke/bin/python -c "
+          import zipfile, glob
+          names = zipfile.ZipFile(glob.glob('dist/*.whl')[0]).namelist()
+          # flytekitplugins is a namespace package shared with other plugins.
+          assert 'flytekitplugins/__init__.py' not in names, names
+          import flytekitplugins.anakin as a
+          tasks = [n for n in a.__all__ if n.islower() and not n.startswith('_')]
+          assert len(tasks) == 24, tasks
+          "
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7

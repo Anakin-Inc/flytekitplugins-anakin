@@ -1,261 +1,182 @@
-"""Flyte tasks for the Anakin API (https://api.anakin.io/v1).
+"""Flyte tasks for the Anakin web data API (https://api.anakin.io/v1).
 
-These are plain ``@task``-decorated functions, not a custom ``PythonTask``
-subclass or backend connector. That is a deliberate, research-backed scope
-decision, not a shortcut:
+These are plain ``@task`` functions: Anakin is an HTTP API, so nothing here
+needs a custom ``PythonTask`` type or a backend connector. Import them into a
+workflow like any other task.
 
-- Flyte's own "Task plugins" documentation states that a standard
-  ``@task``-decorated function wrapping a third-party API call "requires no
-  plugin machinery... it's simply a normal Python function." Custom
-  ``PythonTask``/connector subclasses (e.g. ``flytekitplugins-openai``'s
-  ``ChatGPTTask``, which mixes in ``SyncConnectorExecutorMixin`` and requires
-  a *backend* connector service deployed on the Flyte cluster) exist for
-  cases needing custom serialization, remote execution semantics, or
-  cluster-side infrastructure — none of which apply here. Anakin's API is a
-  plain synchronous HTTP call (``/search``) or submit-and-poll call
-  (``/url-scraper``, ``/agentic-search``), and ``anakin-sdk`` already does
-  the HTTP/retry/polling work; a task body just calls it, exactly like any
-  other Python function that happens to hit a network API.
-- The package is still laid out as a namespace-package ``flytekitplugins.*``
-  microlib per ``flyteorg/flytekit``'s own plugin-authoring guidelines
-  (`plugins/README.md`), so ``pip install flytekitplugins-anakin`` and
-  ``from flytekitplugins.anakin import scrape_url`` read exactly like any
-  other flytekit plugin. The ``entry_points={"flytekit.plugins": ...}``
-  auto-load hook those guidelines mention is explicitly documented as
-  optional — "for plugins where auto-loading on installation is desirable"
-  such as type/data plugins that must register themselves as a side effect
-  of import (e.g. ``TypeEngine.register(...)``). Nothing here needs that:
-  these tasks are used the normal way, by importing them into a workflow.
+Every task except ``browser_task`` delegates to the official ``anakin-sdk``
+client, which handles request bodies, retries on 429/5xx and job polling.
+``browser_task`` calls ``POST /ai/evaluate`` directly because the SDK doesn't
+wrap that endpoint yet.
 
-Auth: the Anakin API key is read from Flyte's secret manager via
-``secret_requests`` + ``current_context().secrets.get(...)`` — the
-documented Flyte pattern for injecting credentials into a task without
-putting them in task inputs or workflow code
-(see ``docs/user_guide/productionizing/secrets.md`` in flyteorg/flyte).
-Falls back to the ``ANAKIN_API_KEY`` environment variable — the same
-fallback ``anakin.Anakin()`` itself implements — when no secret is mounted,
-so these tasks also work with ``pyflyte run`` locally with no Flyte backend
-or secret manager involved at all.
+Outputs are the SDK's Pydantic models (``Document``, ``WireResult``,
+``Monitor``...), which flytekit serializes natively, so downstream tasks get
+typed objects. Free-form JSON inputs and outputs (action params, JSON
+Schemas, browser task results) are typed as plain ``dict``, which flytekit
+stores as JSON; ``dict[str, Any]`` would make it pickle every value.
 
-Coverage: this module now wraps all 21 of Anakin's API capabilities, not
-just the original 3 (``scrape_url``, ``search``, ``agentic_search``). Two
-strategies, chosen per capability based on what actually exists in
-``anakin-sdk`` v0.1.0 (read directly from ``anakin-py/src/anakin/client.py``,
-not assumed):
+Auth: tasks read the API key from the Flyte secret ``anakin/api-key``
+(``ANAKIN_SECRET_GROUP`` / ``ANAKIN_SECRET_KEY``), then the
+``ANAKIN_API_KEY`` environment variable. With neither, the client runs in
+keyless mode, where ``scrape_url``, ``wire_discover``, ``wire_catalogs`` and
+``wire_catalog`` work on a small free per-IP allowance.
 
-- Where ``anakin-sdk`` already implements the endpoint (``map``, ``crawl``,
-  ``wire``, ``sessions.list``/``sessions.delete``), the task is a thin
-  wrapper around the SDK client, exactly like the original 3 tasks.
-- Where it doesn't (Wire discovery/catalog/identities/login/build, website
-  monitoring, AI visibility, AI browser automation — confirmed missing by
-  reading the SDK source in full), the task calls the REST API directly via
-  the small ``httpx``-based helper in ``_http.py``, using the same auth
-  header and retry/poll behavior the SDK itself uses internally. Ground
-  truth for every one of those endpoints is ``anakin-mcp/src/client.ts``
-  (Anakin's own MCP server, a second independent implementation against the
-  same REST API), read directly, not invented.
-
-See ``README.md`` for the full task table with an SDK-vs-raw-HTTP column.
+- Scrape and search: ``scrape_url``, ``map_site``, ``crawl_site``,
+  ``search``, ``agentic_search``
+- Wire: ``wire_discover``, ``wire_catalogs``, ``wire_catalog``,
+  ``wire_read_action``, ``wire_write_action``, ``wire_identities``,
+  ``wire_login``, ``wire_build``, ``wire_build_status``
+- Website monitoring: ``monitor_create``, ``monitor_list``, ``monitor_get``,
+  ``monitor_changes``, ``monitor_control``
+- AI visibility: ``ai_visibility_sources``, ``ai_visibility_search``
+- Browser: ``session_list``, ``session_delete``, ``browser_task``
 """
 
 from __future__ import annotations
 
+import logging
 import os
-from typing import Any, Literal, Optional
-from urllib.parse import quote
+from typing import Any, Optional, TypeVar
 
-from flytekit import Secret, current_context, task
-
+import httpx
 from anakin import Anakin
 from anakin.models import (
     AgenticSearchResult,
+    AIVisibilitySearch,
+    AIVisibilitySource,
     BrowserSession,
     CrawlResult,
     Document,
     MapResult,
+    Monitor,
+    MonitorChange,
     SearchResult,
+    WireActionMatch,
+    WireBuildRequest,
+    WireCatalog,
+    WireCatalogDetail,
+    WireIdentity,
+    WireLoginResult,
     WireResult,
 )
+from flytekit import Secret, current_context, task
+from pydantic import BaseModel
 
-from . import _http
+from flytekitplugins.anakin import _http
+from flytekitplugins.anakin._policy import financial_block_reason
 
-#: Secret group/key Flyte tasks in this module request. Create the secret
-#: with e.g. ``flytectl create secret --name api-key --group anakin
-#: --value ask-...`` (or your Flyte deployment's equivalent) before running
-#: these tasks against a real cluster.
+#: Flyte secret holding the Anakin API key. Create it with
+#: ``flytectl create secret --name api-key --group anakin --value ask_...``
+#: (or your deployment's equivalent) before running on a cluster.
 ANAKIN_SECRET_GROUP = "anakin"
 ANAKIN_SECRET_KEY = "api-key"
 
+#: Overridden by the ``ANAKIN_BASE_URL`` environment variable (internal and
+#: test environments only).
 DEFAULT_ANAKIN_BASE_URL = "https://api.anakin.io/v1"
 
-_ANAKIN_SECRET_REQUEST = Secret(group=ANAKIN_SECRET_GROUP, key=ANAKIN_SECRET_KEY)
+_SECRET = Secret(group=ANAKIN_SECRET_GROUP, key=ANAKIN_SECRET_KEY)
+
+logger = logging.getLogger("flytekitplugins.anakin")
+
+_M = TypeVar("_M", bound=BaseModel)
 
 
-def _client(base_url: str) -> Anakin:
-    """Build an ``anakin.Anakin`` SDK client for the current task execution.
-
-    Tries Flyte's secret manager first; falls through to
-    ``anakin.Anakin()``'s own ``ANAKIN_API_KEY`` env var fallback if no
-    secret is mounted (e.g. local ``pyflyte run``, or a cluster where the
-    key is injected as a plain env var instead of a Flyte-managed secret).
-    """
-    api_key: Optional[str] = None
+def _api_key() -> Optional[str]:
+    """The Flyte secret if one is mounted, else ``ANAKIN_API_KEY``, else None."""
     try:
-        api_key = current_context().secrets.get(ANAKIN_SECRET_GROUP, ANAKIN_SECRET_KEY)
-    except Exception:
-        api_key = None
-    return Anakin(api_key=api_key, base_url=base_url)
+        key = current_context().secrets.get(ANAKIN_SECRET_GROUP, ANAKIN_SECRET_KEY)
+    except ValueError:
+        # Raised when the secret is neither in the environment nor mounted,
+        # e.g. under local `pyflyte run`.
+        key = None
+    return key or os.environ.get("ANAKIN_API_KEY") or None
 
 
-def _resolve_api_key() -> str:
-    """Resolve the Anakin API key for the raw-``httpx`` tasks in this module
-    (the endpoints ``anakin-sdk`` doesn't cover — see module docstring).
+def _base_url() -> str:
+    return os.environ.get("ANAKIN_BASE_URL") or DEFAULT_ANAKIN_BASE_URL
 
-    Same secret-then-env-var resolution order as ``_client()``, but explicit
-    and eager here: unlike ``Anakin(api_key=None, ...)``, which defers its
-    own ``ANAKIN_API_KEY`` fallback (and ``ConfigurationError``) to
-    ``anakin._http.HttpClient.__init__``, ``_http.request()`` has no such
-    fallback built in — it just needs a string.
-    """
-    api_key: Optional[str] = None
-    try:
-        api_key = current_context().secrets.get(ANAKIN_SECRET_GROUP, ANAKIN_SECRET_KEY)
-    except Exception:
-        api_key = None
-    if not api_key:
-        api_key = os.environ.get("ANAKIN_API_KEY")
-    if not api_key:
-        raise _http.AnakinAPIError(
-            "Anakin API key not provided. Create the Flyte secret "
-            f"(group={ANAKIN_SECRET_GROUP!r}, key={ANAKIN_SECRET_KEY!r}) or set "
-            "the ANAKIN_API_KEY environment variable."
+
+def _client() -> Anakin:
+    return Anakin(api_key=_api_key(), base_url=_base_url())
+
+
+def _http_client() -> httpx.Client:
+    key = _api_key()
+    if not key:
+        raise ValueError(
+            "This task needs an Anakin API key: create the Flyte secret "
+            f"{ANAKIN_SECRET_GROUP}/{ANAKIN_SECRET_KEY} or set ANAKIN_API_KEY. "
+            "Get a key at https://anakin.io/dashboard (the free tier needs no card)."
         )
-    return api_key
+    return httpx.Client(base_url=_base_url(), headers={"X-API-Key": key}, timeout=60.0)
 
 
-# ─── url-scraper ────────────────────────────────────────────────────────────
+def _refuse_if_financial(text: str, what: str) -> None:
+    blocked = financial_block_reason(text)
+    if blocked:
+        logger.error("Refusing %s: %s", what, blocked)
+        raise ValueError(blocked)
 
 
-@task(secret_requests=[_ANAKIN_SECRET_REQUEST])
+def _redact(model: _M) -> _M:
+    """Hide the webhook signing secret: Flyte stores task outputs and shows them in the UI."""
+    if getattr(model, "alert_webhook_secret", None):
+        return model.model_copy(update={"alert_webhook_secret": _http.REDACTED})
+    return model
+
+
+# ─── Scrape and search ──────────────────────────────────────────────────────
+
+
+@task(secret_requests=[_SECRET])
 def scrape_url(
     url: str,
     country: str = "us",
     use_browser: bool = False,
     generate_json: bool = False,
+    output_schema: Optional[dict] = None,
+    formats: Optional[list[str]] = None,
     force_fresh: bool = False,
     session_id: Optional[str] = None,
     session_name: Optional[str] = None,
     poll_timeout: Optional[float] = None,
-    base_url: str = DEFAULT_ANAKIN_BASE_URL,
 ) -> Document:
-    """Scrape a single URL via Anakin.
+    """Scrape one URL to markdown, optionally extracting structured JSON with AI.
 
-    Submits ``POST /url-scraper`` and polls ``GET /url-scraper/:jobId``
-    until the job reaches a terminal state (handled inside ``anakin-sdk``,
-    not reimplemented here). Returns the SDK's ``Document`` model directly —
-    flytekit >= 1.14 natively serializes Pydantic v2 ``BaseModel`` task
-    outputs (MessagePack-encoded), so no manual ``model_dump()`` flattening
-    is needed the way an Airflow XCom backend would require.
+    Works without an API key on a small free per-IP allowance.
 
     :param url: The URL to scrape.
-    :param country: Proxy country code, e.g. ``"us"``, ``"gb"``, ``"de"``.
-    :param use_browser: Use a headless browser — needed for JS-heavy sites.
-    :param generate_json: AI-extract structured JSON from the page content.
-    :param force_fresh: Bypass the cache and force a fresh extraction.
-    :param session_id: Reuse an existing authenticated browser session.
-    :param session_name: Name for a new session when ``session_id`` is unset.
-    :param poll_timeout: Seconds to wait for the job to finish; falls back
-        to the SDK client's own default (300s) when unset.
-    :param base_url: Anakin API base URL; override only for internal/test
-        environments.
+    :param country: Proxy country code, e.g. "us", "gb", "de".
+    :param use_browser: Render with a headless browser. Use for JavaScript-heavy pages.
+    :param generate_json: Extract structured JSON from the page with AI.
+    :param output_schema: JSON Schema for the extracted JSON (implies AI extraction).
+    :param formats: Output formats, any of "markdown" (default), "html",
+        "cleaned_html", "screenshot", "links".
+    :param force_fresh: Skip the cache and fetch the page again.
+    :param session_id: Saved browser session to scrape as a logged-in user.
+    :param session_name: Saved browser session name (alternative to ``session_id``).
+    :param poll_timeout: Seconds to wait for the job (SDK default: 300).
+    :return: The scraped ``Document``: ``markdown``, ``generated_json``, ``html`` and more.
     """
-    client = _client(base_url)
-    return client.scrape(
+    logger.info("Scraping %s (use_browser=%s)", url, use_browser)
+    document = _client().scrape(
         url,
+        formats=tuple(formats or ("markdown",)),  # type: ignore[arg-type]
         country=country,
         use_browser=use_browser,
         generate_json=generate_json,
+        output_schema=output_schema,
         force_fresh=force_fresh,
         session_id=session_id,
         session_name=session_name,
         poll_timeout=poll_timeout,
     )
+    logger.info("Scraped %s (job %s, cached=%s)", url, document.id, document.cached)
+    return document
 
 
-# ─── search (synchronous) ───────────────────────────────────────────────────
-
-
-@task(secret_requests=[_ANAKIN_SECRET_REQUEST])
-def search(
-    prompt: str,
-    limit: int = 5,
-    base_url: str = DEFAULT_ANAKIN_BASE_URL,
-) -> SearchResult:
-    """AI-powered web search via Anakin — synchronous, no polling.
-
-    Submits ``POST /search`` and returns immediately. Costs 3 credits per
-    call per the Anakin API contract.
-
-    :param prompt: The search query or question.
-    :param limit: Maximum number of results to return (default 5).
-    :param base_url: Anakin API base URL; override only for internal/test
-        environments.
-    """
-    client = _client(base_url)
-    return client.search(prompt, limit=limit)
-
-
-# ─── agentic-search ─────────────────────────────────────────────────────────
-
-
-@task(secret_requests=[_ANAKIN_SECRET_REQUEST])
-def agentic_search(
-    prompt: str,
-    use_browser: bool = True,
-    schema: Optional[dict[str, Any]] = None,
-    poll_timeout: Optional[float] = None,
-    base_url: str = DEFAULT_ANAKIN_BASE_URL,
-) -> AgenticSearchResult:
-    """Multi-stage AI research pipeline via Anakin: search, scrape citation
-    sources, and extract structured data with a summary.
-
-    Submits ``POST /agentic-search`` and polls ``GET /agentic-search/:jobId``
-    until terminal. Slower than :func:`search` (can take minutes) and costs
-    10 credits per call.
-
-    :param prompt: The research question or topic (max 8KB).
-    :param use_browser: Use a headless browser for citation scraping.
-        Defaults to ``True`` — matches the ``anakin-sdk`` client default
-        (note this is the opposite default from :func:`scrape_url`'s
-        ``use_browser=False`` — preserved here rather than flattened to one
-        default, per ``anakin-py/src/anakin/client.py``).
-    :param schema: Optional JSON Schema (max 50KB) constraining the
-        structured output. Leave unset to let the pipeline choose its own.
-    :param poll_timeout: Seconds to wait for the job to finish; falls back
-        to the SDK client's own default (300s) when unset.
-    :param base_url: Anakin API base URL; override only for internal/test
-        environments.
-    """
-    client = _client(base_url)
-    return client.agentic_search(
-        prompt,
-        use_browser=use_browser,
-        schema=schema,
-        poll_timeout=poll_timeout,
-    )
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# The remaining 18 capabilities. Each section header notes whether the task
-# wraps anakin-sdk (like the three above) or calls the REST API directly via
-# ``_http.py`` (for endpoints the SDK doesn't implement yet).
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-# ─── map (anakin-sdk: Anakin.map) ───────────────────────────────────────────
-
-
-@task(secret_requests=[_ANAKIN_SECRET_REQUEST])
+@task(secret_requests=[_SECRET])
 def map_site(
     url: str,
     limit: int = 100,
@@ -267,36 +188,25 @@ def map_site(
     use_browser: bool = False,
     session_id: Optional[str] = None,
     poll_timeout: Optional[float] = None,
-    base_url: str = DEFAULT_ANAKIN_BASE_URL,
 ) -> MapResult:
-    """Discover URLs on a website (sitemap + link traversal) via Anakin.
+    """Discover the URLs on a site (sitemap plus link traversal).
 
-    Named ``map_site`` rather than ``map`` to avoid shadowing the Python
-    builtin — same naming rationale as ``scrape_url`` vs. the SDK's
-    ``scrape``. Submits ``POST /map`` and polls ``GET /map/:jobId`` until
-    terminal (both handled inside ``anakin-sdk``).
+    Useful before ``crawl_site``, or to pick pages for ``scrape_url``.
 
-    :param url: The starting URL for discovery (typically a homepage or
-        section root).
-    :param limit: Maximum number of URLs to return overall.
-    :param depth: How many link-hops from the starting URL to follow.
-    :param limit_per_level: Maximum URLs collected per depth level (controls
-        breadth).
-    :param include_subdomains: Include URLs on subdomains of the starting
-        host.
-    :param include_external_links: Also collect (but do not follow) external
-        links.
-    :param search: Optional keyword filter — only return URLs whose
-        path/title matches.
-    :param use_browser: Render with a headless browser — needed for SPAs.
-    :param session_id: Reuse an existing authenticated browser session.
-    :param poll_timeout: Seconds to wait for the job to finish; falls back
-        to the SDK client's own default (300s) when unset.
-    :param base_url: Anakin API base URL; override only for internal/test
-        environments.
+    :param url: Starting URL, usually a homepage or section root.
+    :param limit: Maximum URLs to return (max 5000).
+    :param depth: Link hops to follow from ``url`` (max 5).
+    :param limit_per_level: Maximum URLs collected per depth level.
+    :param include_subdomains: Include URLs on subdomains of the starting host.
+    :param include_external_links: Also collect (but don't follow) external links.
+    :param search: Only return URLs whose path or title matches this keyword.
+    :param use_browser: Render with a headless browser. Needed for SPAs.
+    :param session_id: Saved browser session to map as a logged-in user.
+    :param poll_timeout: Seconds to wait for the job (SDK default: 300).
+    :return: ``links``, ``total_links``, ``external_links`` and timing.
     """
-    client = _client(base_url)
-    return client.map(
+    logger.info("Mapping %s (depth=%d, limit=%d)", url, depth, limit)
+    result = _client().map(
         url,
         limit=limit,
         depth=depth,
@@ -308,12 +218,11 @@ def map_site(
         session_id=session_id,
         poll_timeout=poll_timeout,
     )
+    logger.info("Map of %s found %d link(s)", url, result.total_links)
+    return result
 
 
-# ─── crawl (anakin-sdk: Anakin.crawl) ───────────────────────────────────────
-
-
-@task(secret_requests=[_ANAKIN_SECRET_REQUEST])
+@task(secret_requests=[_SECRET])
 def crawl_site(
     url: str,
     max_pages: int = 10,
@@ -324,379 +233,295 @@ def crawl_site(
     use_browser: bool = False,
     session_id: Optional[str] = None,
     poll_timeout: Optional[float] = None,
-    base_url: str = DEFAULT_ANAKIN_BASE_URL,
 ) -> CrawlResult:
-    """Bulk-fetch markdown across a site via Anakin (catalog ingestion,
-    site-wide RAG corpus building).
-
-    Submits ``POST /crawl`` and polls ``GET /crawl/:jobId`` until terminal
-    (both handled inside ``anakin-sdk``).
+    """Fetch markdown for many pages of a site in one job.
 
     :param url: Starting URL.
-    :param max_pages: Hard cap on pages fetched.
-    :param depth: Link-hops from the starting URL to follow.
-    :param include_patterns: Glob/regex patterns; only URLs matching at
-        least one are fetched.
-    :param exclude_patterns: Glob/regex patterns; URLs matching any are
-        skipped.
-    :param country: Proxy egress country code, e.g. ``"us"``, ``"gb"``.
-    :param use_browser: Render each page in a headless browser — needed for
-        SPAs.
-    :param session_id: Optional saved-browser-session ID for login-protected
-        sites.
-    :param poll_timeout: Seconds to wait for the job to finish; falls back
-        to the SDK client's own default (300s) when unset.
-    :param base_url: Anakin API base URL; override only for internal/test
-        environments.
+    :param max_pages: Maximum pages fetched.
+    :param depth: Link hops to follow from ``url``.
+    :param include_patterns: Only fetch URLs matching at least one of these patterns.
+    :param exclude_patterns: Skip URLs matching any of these patterns.
+    :param country: Proxy country code.
+    :param use_browser: Render each page with a headless browser.
+    :param session_id: Saved browser session to crawl as a logged-in user.
+    :param poll_timeout: Seconds to wait for the job (SDK default: 300).
+    :return: ``total_pages``, ``completed_pages`` and ``pages`` (each with
+        ``url``, ``status``, ``markdown`` and ``error``).
     """
-    client = _client(base_url)
-    return client.crawl(
+    logger.info("Crawling %s (max_pages=%d, depth=%d)", url, max_pages, depth)
+    result = _client().crawl(
         url,
         max_pages=max_pages,
         depth=depth,
-        include_patterns=tuple(include_patterns or ()),
-        exclude_patterns=tuple(exclude_patterns or ()),
+        include_patterns=include_patterns or (),
+        exclude_patterns=exclude_patterns or (),
         country=country,
         use_browser=use_browser,
         session_id=session_id,
         poll_timeout=poll_timeout,
     )
+    logger.info(
+        "Crawl of %s fetched %d/%d page(s)", url, result.completed_pages, result.total_pages
+    )
+    return result
 
 
-# ─── wire: run a pre-built action (anakin-sdk: Anakin.wire) ────────────────
-#
-# anakin-mcp splits execution into two tools, wire_read_action and
-# wire_write_action, purely by the action's declared type (read vs. write)
-# so each can carry an honest safety annotation for its marketplace listing
-# (see anakin-mcp/src/tools/wire.ts's module docstring) — both call the same
-# underlying `POST /wire/task` + poll `GET /wire/jobs/:id`. Mirrored here as
-# two tasks over the same anakin-sdk `Anakin.wire()` call, for the same
-# reason: a workflow author picking `wire_write_action` is an explicit,
-# visible signal that a step can change state on a third-party site, which
-# `wire_read_action` alone never implies.
-#
-# Note: anakin-sdk v0.1.0's `wire()` does not yet accept `credential_id` /
-# `identity_id`, even though the REST API supports both (see
-# `WireRunOptions` in anakin-mcp/src/client.ts) — confirmed by reading
-# `anakin-py/src/anakin/client.py` in full, not an oversight in this
-# package. Actions with `auth_mode="required"` will fail with
-# `WireAuthRequiredError` until the SDK adds that parameter; use
-# `wire_identities`/`wire_login` (below) to obtain a credential in the
-# meantime and pass it once the SDK supports it.
+@task(secret_requests=[_SECRET])
+def search(prompt: str, limit: int = 5) -> SearchResult:
+    """AI web search with citations. Synchronous.
+
+    :param prompt: The search query or question.
+    :param limit: Maximum results (max 20).
+    :return: ``results``, each with ``url``, ``title``, ``snippet`` and ``date``.
+    """
+    logger.info("Searching: %s (limit=%d)", prompt, limit)
+    result = _client().search(prompt, limit=limit)
+    logger.info("Search returned %d result(s)", len(result.results))
+    return result
 
 
-@task(secret_requests=[_ANAKIN_SECRET_REQUEST])
+@task(secret_requests=[_SECRET])
+def agentic_search(
+    prompt: str,
+    use_browser: bool = True,
+    schema: Optional[dict] = None,
+    poll_timeout: Optional[float] = None,
+) -> AgenticSearchResult:
+    """Multi-step research: search, scrape the cited pages, return a structured answer.
+
+    Takes minutes rather than seconds. Use ``search`` for quick lookups.
+
+    :param prompt: The research question (max 8 KB).
+    :param use_browser: Scrape citations with a headless browser.
+    :param schema: Optional JSON Schema (max 50 KB) for ``structured_data``.
+    :param poll_timeout: Seconds to wait for the job (SDK default: 300).
+    :return: ``status`` and ``generated_json`` with ``summary``,
+        ``structured_data`` and ``data_schema``.
+    """
+    logger.info("Running agentic search: %s", prompt)
+    result = _client().agentic_search(
+        prompt, use_browser=use_browser, schema=schema, poll_timeout=poll_timeout
+    )
+    logger.info("Agentic search %s finished with status=%s", result.id, result.status)
+    return result
+
+
+# ─── Wire ───────────────────────────────────────────────────────────────────
+
+
+@task(secret_requests=[_SECRET])
+def wire_discover(
+    q: str, catalog: Optional[str] = None, limit: Optional[int] = None
+) -> list[WireActionMatch]:
+    """Find Wire actions for a task described in plain language.
+
+    Works without an API key.
+
+    :param q: What you want to do, e.g. "top phones on walmart".
+    :param catalog: Restrict to one site's catalog slug, e.g. "amazon".
+    :param limit: Maximum candidate actions to return.
+    :return: Ranked actions, each with ``action_id``, ``catalog_slug``,
+        ``params`` and ``credits``. Pass an ``action_id`` to
+        ``wire_read_action`` or ``wire_write_action``.
+    """
+    logger.info("Discovering Wire actions for: %s", q)
+    matches = _client().wire.discover(q, catalog=catalog, limit=limit)
+    logger.info("Wire discovery returned %d action(s)", len(matches))
+    return matches
+
+
+@task(secret_requests=[_SECRET])
+def wire_catalogs() -> list[WireCatalog]:
+    """List every site in the Wire catalog with its action count.
+
+    Works without an API key.
+
+    :return: One entry per site; pass its ``slug`` to ``wire_catalog``.
+    """
+    return _client().wire.catalogs()
+
+
+@task(secret_requests=[_SECRET])
+def wire_catalog(slug: str) -> WireCatalogDetail:
+    """One Wire site's actions: parameter schema, mode, auth mode, credit cost.
+
+    Works without an API key.
+
+    :param slug: The site, e.g. "walmart" (see ``wire_catalogs``).
+    :return: The site's actions and, if it needs credentials, its login fields.
+    """
+    logger.info("Fetching Wire catalog %s", slug)
+    return _client().wire.catalog(slug)
+
+
+@task(secret_requests=[_SECRET])
 def wire_read_action(
     action_id: str,
-    params: Optional[dict[str, Any]] = None,
+    params: Optional[dict] = None,
+    credential_id: Optional[str] = None,
+    identity_id: Optional[str] = None,
     poll_timeout: Optional[float] = None,
-    base_url: str = DEFAULT_ANAKIN_BASE_URL,
 ) -> WireResult:
-    """Run a Wire READ action — one that extracts data without changing
-    state on the target site (search listings, fetch a product's
-    price/specs, read a profile, pull dashboard metrics).
+    """Run a Wire read action, which extracts data without changing anything on the site.
 
-    Find ``action_id``\\ s via :func:`wire_discover` or :func:`wire_catalog`
-    and confirm the action's ``type`` is ``"read"``; ``params`` must match
-    that action's parameter schema. Submits ``POST /holocron/task`` and
-    polls ``GET /holocron/jobs/:jobId`` until terminal (both handled inside
-    ``anakin-sdk``). For state-changing actions use
-    :func:`wire_write_action` instead.
+    For actions that change state, use ``wire_write_action``.
 
-    :param action_id: The Wire action to run.
-    :param params: The action's input parameters (its schema comes from
-        discovery); omit for actions that take none.
-    :param poll_timeout: Seconds to wait for the job to finish; falls back
-        to the SDK client's own default (300s) when unset.
-    :param base_url: Anakin API base URL; override only for internal/test
-        environments.
+    :param action_id: The action to run, from ``wire_discover`` or ``wire_catalog``.
+    :param params: The action's parameters, as described by discovery.
+    :param credential_id: Needed when the action's ``auth_mode`` is "required".
+        Get one from ``wire_identities`` or ``wire_login``.
+    :param identity_id: Alternative to ``credential_id``: run as this saved identity.
+    :param poll_timeout: Seconds to wait for the job (SDK default: 300).
+    :return: ``job_id``, ``status``, ``data``, ``credits_used`` and ``error``.
     """
-    client = _client(base_url)
-    return client.wire(action_id, params or {}, poll_timeout=poll_timeout)
+    logger.info("Running Wire read action %s", action_id)
+    result = _client().wire.run(
+        action_id,
+        params or {},
+        credential_id=credential_id,
+        identity_id=identity_id,
+        poll_timeout=poll_timeout,
+    )
+    logger.info("Wire action %s finished with status=%s", action_id, result.status)
+    return result
 
 
-@task(secret_requests=[_ANAKIN_SECRET_REQUEST])
+@task(secret_requests=[_SECRET])
 def wire_write_action(
     action_id: str,
-    params: Optional[dict[str, Any]] = None,
+    params: Optional[dict] = None,
+    credential_id: Optional[str] = None,
+    identity_id: Optional[str] = None,
     poll_timeout: Optional[float] = None,
-    base_url: str = DEFAULT_ANAKIN_BASE_URL,
 ) -> WireResult:
-    """Run a Wire WRITE action — one that performs a state-changing
-    interaction on the target site (submit a form, add to cart, post
-    content, update account settings).
+    """Run a Wire write action: submit a form, add to cart, post content, update settings.
 
-    Find ``action_id``\\ s via :func:`wire_discover` or :func:`wire_catalog`
-    and confirm the action's ``type`` is ``"write"``; ``params`` must match
-    that action's parameter schema. Most write actions require auth — see
-    the module note above on ``credential_id`` (not yet supported by
-    ``anakin-sdk`` v0.1.0). Submits ``POST /holocron/task`` and polls
-    ``GET /holocron/jobs/:jobId`` until terminal (both handled inside
-    ``anakin-sdk``). For read-only data extraction use
-    :func:`wire_read_action` instead.
+    Don't give this task Flyte ``retries`` or ``cache``: repeating a write
+    can duplicate it. Refuses (raises ``ValueError`` before calling the API)
+    anything that looks like a payment or fund transfer.
 
-    :param action_id: The Wire action to run.
-    :param params: The action's input parameters (its schema comes from
-        discovery); omit for actions that take none.
-    :param poll_timeout: Seconds to wait for the job to finish; falls back
-        to the SDK client's own default (300s) when unset.
-    :param base_url: Anakin API base URL; override only for internal/test
-        environments.
+    :param action_id: The action to run, from ``wire_discover`` or ``wire_catalog``.
+    :param params: The action's parameters, as described by discovery.
+    :param credential_id: Needed when the action's ``auth_mode`` is "required".
+    :param identity_id: Alternative to ``credential_id``: run as this saved identity.
+    :param poll_timeout: Seconds to wait for the job (SDK default: 300).
+    :return: Same shape as ``wire_read_action``.
     """
-    client = _client(base_url)
-    return client.wire(action_id, params or {}, poll_timeout=poll_timeout)
+    resolved_params = params or {}
+    _refuse_if_financial(f"{action_id} {resolved_params}", f"Wire action {action_id}")
 
-
-# ─── wire: discovery & account management (raw HTTP — not in anakin-sdk) ──
-
-
-@task(secret_requests=[_ANAKIN_SECRET_REQUEST])
-def wire_discover(
-    q: str,
-    limit: int = 5,
-    base_url: str = DEFAULT_ANAKIN_BASE_URL,
-) -> dict[str, Any]:
-    """Find Wire actions for a task from a natural-language intent.
-
-    Calls ``GET /wire/resolve`` directly — not covered by ``anakin-sdk``
-    v0.1.0. Returns ranked candidate actions, each with its ``action_id``,
-    ``type`` (``"read"``/``"write"``), required/optional params, credit
-    cost, and whether auth is needed. Run a returned action with
-    :func:`wire_read_action` or :func:`wire_write_action`.
-
-    :param q: The intent in natural language, e.g. ``"top phones on
-        walmart"``, ``"search airbnb listings in Lisbon"``.
-    :param limit: Maximum number of candidate actions to return.
-    :param base_url: Anakin API base URL; override only for internal/test
-        environments.
-    """
-    api_key = _resolve_api_key()
-    params = {"q": q, "limit": limit}
-    return _http.as_dict(
-        _http.request("GET", "/wire/resolve", api_key=api_key, base_url=base_url, params=params)
+    logger.info("Running Wire write action %s", action_id)
+    result = _client().wire.run(
+        action_id,
+        resolved_params,
+        credential_id=credential_id,
+        identity_id=identity_id,
+        poll_timeout=poll_timeout,
     )
+    logger.info("Wire action %s finished with status=%s", action_id, result.status)
+    return result
 
 
-@task(secret_requests=[_ANAKIN_SECRET_REQUEST])
-def wire_catalog(
-    slug: Optional[str] = None,
-    base_url: str = DEFAULT_ANAKIN_BASE_URL,
-) -> dict[str, Any]:
-    """Browse the Wire catalog.
+@task(secret_requests=[_SECRET])
+def wire_identities(catalog_id: Optional[str] = None) -> list[WireIdentity]:
+    """List your saved Wire identities (site accounts) and their credentials.
 
-    Calls ``GET /wire/catalog`` (or ``GET /wire/catalog/:slug``) directly —
-    not covered by ``anakin-sdk`` v0.1.0. With no ``slug``, lists every
-    supported website and its action count. With a ``slug`` (e.g.
-    ``"walmart"``, ``"amazon"``, ``"linkedin"``), returns that site's full
-    action list with exact parameter schemas, each action's type and auth
-    mode, and credit cost.
-
-    :param slug: Catalog slug to inspect. Omit to list all catalogs.
-    :param base_url: Anakin API base URL; override only for internal/test
-        environments.
+    :param catalog_id: Only identities for this catalog.
+    :return: Identities, each with ``credentials``; every credential's ``id``
+        can be passed as ``credential_id`` to the Wire action tasks.
     """
-    api_key = _resolve_api_key()
-    path = f"/wire/catalog/{quote(slug, safe='')}" if slug else "/wire/catalog"
-    return _http.as_dict(_http.request("GET", path, api_key=api_key, base_url=base_url))
+    return _client().wire.identities(catalog_id=catalog_id)
 
 
-@task(secret_requests=[_ANAKIN_SECRET_REQUEST])
-def wire_identities(
-    catalog_id: Optional[str] = None,
-    base_url: str = DEFAULT_ANAKIN_BASE_URL,
-) -> dict[str, Any]:
-    """List your saved Wire identities and their credentials.
-
-    Calls ``GET /wire/identities`` directly — not covered by ``anakin-sdk``
-    v0.1.0. Each credential's ``id`` is a ``credential_id`` usable (once the
-    SDK supports it — see the ``wire_read_action``/``wire_write_action``
-    module note) to run actions whose ``auth_mode`` is ``"required"``.
-
-    :param catalog_id: Optional — restrict to identities for a single
-        catalog.
-    :param base_url: Anakin API base URL; override only for internal/test
-        environments.
-    """
-    api_key = _resolve_api_key()
-    params = {"catalog_id": catalog_id} if catalog_id else None
-    return _http.as_dict(
-        _http.request(
-            "GET", "/wire/identities", api_key=api_key, base_url=base_url, params=params
-        )
-    )
-
-
-@task(secret_requests=[_ANAKIN_SECRET_REQUEST])
+@task(secret_requests=[_SECRET])
 def wire_login(
     catalog_slug: str,
-    params: Optional[dict[str, Any]] = None,
+    params: Optional[dict] = None,
     identity_name: Optional[str] = None,
     source_id: Optional[str] = None,
-    source_ref: Optional[dict[str, Any]] = None,
-    base_url: str = DEFAULT_ANAKIN_BASE_URL,
-) -> dict[str, Any]:
-    """Sign in to a credentials-mode Wire site and get a ``credential_id``.
+    source_ref: Optional[dict] = None,
+) -> WireLoginResult:
+    """Sign in to a site that needs credentials and get a ``credential_id``.
 
-    Calls ``POST /wire/login`` directly — not covered by ``anakin-sdk``
-    v0.1.0. Only needed for actions whose ``auth_mode`` is ``"required"``,
-    and only for catalogs that support password sign-in. The password is
-    never stored by Anakin, only the encrypted session.
+    Anakin stores the encrypted session, never the password. Flyte records
+    task inputs, so don't pass a password literal from workflow code: read it
+    from a Flyte secret inside a task, or use a 1Password ``source_id``.
 
-    :param catalog_slug: The catalog to sign in to (e.g. ``"neb"``).
-    :param params: Login fields defined by the catalog (e.g. ``{"email":
-        ..., "password": ...}``) — see :func:`wire_catalog`'s
-        ``login_input_schema`` for the field names.
-    :param identity_name: Optional name for the identity. Derived from
-        ``params`` in password mode; required when using a 1Password
-        locator.
-    :param source_id: Optional 1Password identity-source ID (alternative to
-        ``params``).
-    :param source_ref: Optional 1Password item locator (``vault_id``,
-        ``item_id``, ``fields``) — used with ``source_id`` instead of
-        ``params``.
-    :param base_url: Anakin API base URL; override only for internal/test
-        environments.
+    :param catalog_slug: The site to sign in to.
+    :param params: The login fields listed in ``wire_catalog(slug)``'s
+        ``login_input_schema``, e.g. ``{"email": ..., "password": ...}``.
+    :param identity_name: Name for the identity.
+    :param source_id: 1Password identity source, instead of ``params``.
+    :param source_ref: 1Password item locator (``vault_id``, ``item_id``,
+        ``fields``), used with ``source_id``.
+    :return: The login result, including the new ``credential_id``.
     """
-    api_key = _resolve_api_key()
-    body: dict[str, Any] = {"catalog_slug": catalog_slug}
-    if params is not None:
-        body["params"] = params
-    if identity_name is not None:
-        body["identity_name"] = identity_name
-    if source_id is not None:
-        body["source_id"] = source_id
-    if source_ref is not None:
-        body["source_ref"] = source_ref
-    return _http.as_dict(
-        _http.request("POST", "/wire/login", api_key=api_key, base_url=base_url, json=body)
+    logger.info("Signing in to Wire catalog %s", catalog_slug)  # never log params
+    return _client().wire.login(
+        catalog_slug,
+        params,
+        identity_name=identity_name,
+        source_id=source_id,
+        source_ref=source_ref,
     )
 
 
-@task(secret_requests=[_ANAKIN_SECRET_REQUEST])
+@task(secret_requests=[_SECRET])
 def wire_build(
     website_url: str,
     goal: str,
     catalog_id: Optional[str] = None,
-    visibility: Literal["private", "public"] = "private",
+    visibility: str = "private",
     force: bool = False,
-    base_url: str = DEFAULT_ANAKIN_BASE_URL,
-) -> dict[str, Any]:
-    """Request a brand-new Wire action for a website not yet in the catalog.
+) -> WireBuildRequest:
+    """Ask Anakin to build a new Wire action for a site that isn't in the catalog.
 
-    Calls ``POST /wire/build-request`` directly — not covered by
-    ``anakin-sdk`` v0.1.0. Asynchronous (returns ``status="pending"``) and
-    charges credits, refunded automatically if the build fails. Only use
-    this after :func:`wire_discover` / :func:`wire_catalog` confirm no
-    existing action covers the site.
+    Builds run asynchronously: this returns the pending build request. Check
+    on it with ``wire_build_status``. Charges credits up front, refunded if
+    the build fails. Run ``wire_discover`` first to make sure no action
+    exists. Refuses payment or fund-transfer goals (raises ``ValueError``).
 
-    :param website_url: The site to build an action for. The domain is
-        extracted automatically.
-    :param goal: Natural-language description of what the action should do
-        or extract. Be specific — the builder synthesizes the scraper from
-        this.
-    :param catalog_id: Optional — attach to an existing catalog instead of
-        creating one.
-    :param visibility: Action visibility.
-    :param force: Build even if similar actions already exist for the
-        domain (otherwise the request is rejected with ``ACTION_EXISTS``).
-    :param base_url: Anakin API base URL; override only for internal/test
-        environments.
+    :param website_url: The site to build an action for.
+    :param goal: What the action should do or extract. Be specific.
+    :param catalog_id: Attach to an existing catalog instead of creating one.
+    :param visibility: "private" (default) or "public".
+    :param force: Build even if similar actions already exist for the domain.
+    :return: The build request: ``id``, ``status`` and related fields.
     """
-    api_key = _resolve_api_key()
-    body: dict[str, Any] = {
-        "website_url": website_url,
-        "goal": goal,
-        "visibility": visibility,
-        "force": force,
-    }
-    if catalog_id is not None:
-        body["catalog_id"] = catalog_id
-    return _http.as_dict(
-        _http.request(
-            "POST", "/wire/build-request", api_key=api_key, base_url=base_url, json=body
-        )
+    _refuse_if_financial(f"{goal} {website_url}", f"Wire build for {website_url}")
+
+    logger.info("Requesting a Wire action for %s: %s", website_url, goal)
+    build = _client().wire.build(
+        website_url, goal, catalog_id=catalog_id, visibility=visibility, force=force
     )
+    logger.info("Wire build %s is %s", build.id, build.status)
+    return build
 
 
-# ─── browser sessions (anakin-sdk: Anakin.sessions.list / .delete) ─────────
+@task(secret_requests=[_SECRET])
+def wire_build_status(build_id: str) -> WireBuildRequest:
+    """Check a Wire build request started with ``wire_build``.
 
-
-@task(secret_requests=[_ANAKIN_SECRET_REQUEST])
-def session_list(
-    domain: Optional[str] = None,
-    base_url: str = DEFAULT_ANAKIN_BASE_URL,
-) -> list[BrowserSession]:
-    """List your saved browser sessions (encrypted login states captured via
-    the Anakin dashboard or Browser API).
-
-    Each session's ``id`` is what :func:`scrape_url`/:func:`crawl_site`
-    (``session_id``), :func:`monitor_create` (``session_id``), or
-    :func:`browser_task` (``session_id``) take to work with login-protected
-    pages. Calls ``GET /sessions`` via ``anakin-sdk``'s
-    ``Anakin.sessions.list()``.
-
-    :param domain: Filter to sessions for one website domain, e.g.
-        ``"amazon.com"``.
-    :param base_url: Anakin API base URL; override only for internal/test
-        environments.
+    :param build_id: The ``id`` returned by ``wire_build``.
+    :return: The build's ``status`` and, once published, its ``action_id``.
     """
-    client = _client(base_url)
-    return client.sessions.list(domain=domain)
+    return _client().wire.get_build(build_id)
 
 
-@task(secret_requests=[_ANAKIN_SECRET_REQUEST])
-def session_delete(
-    session_id: str,
-    base_url: str = DEFAULT_ANAKIN_BASE_URL,
-) -> None:
-    """Permanently delete a saved browser session and its encrypted login
-    data.
-
-    Irreversible — the user must log in again through the dashboard to
-    recreate it, and anything referencing this ``session_id`` loses
-    authenticated access. Calls ``DELETE /sessions/:id`` via ``anakin-sdk``'s
-    ``Anakin.sessions.delete()``. Find ids with :func:`session_list`.
-
-    :param session_id: The session ID to delete.
-    :param base_url: Anakin API base URL; override only for internal/test
-        environments.
-    """
-    client = _client(base_url)
-    client.sessions.delete(session_id)
+# ─── Website monitoring ─────────────────────────────────────────────────────
 
 
-# ─── website monitoring (raw HTTP — not in anakin-sdk) ─────────────────────
-#
-# The API returns each monitor's `alertWebhookSecret` (an HMAC signing
-# secret) inline. A secret that enters a workflow's task output/logs is
-# compromised by definition (same reasoning anakin-mcp documents in
-# monitor.ts), so every monitor response here is redacted before it's
-# returned as a task output; retrieve the real value from the Anakin
-# dashboard instead.
-
-_REDACTED_SECRET = "[redacted — view in the Anakin dashboard]"
+_MONITOR_ACTIONS = ("pause", "resume", "run_now", "delete")
 
 
-def _redact_monitor_secrets(value: Any) -> Any:
-    """Deep-copy `value` with any `alertWebhookSecret` key's value replaced."""
-    if isinstance(value, list):
-        return [_redact_monitor_secrets(v) for v in value]
-    if isinstance(value, dict):
-        return {
-            k: (_REDACTED_SECRET if k == "alertWebhookSecret" and v else _redact_monitor_secrets(v))
-            for k, v in value.items()
-        }
-    return value
-
-
-@task(secret_requests=[_ANAKIN_SECRET_REQUEST])
+@task(secret_requests=[_SECRET])
 def monitor_create(
     url: str,
     interval_minutes: int,
-    scope: Literal["page", "site", "wire"] = "page",
-    watch_mode: Literal["full_page", "specific_data"] = "full_page",
-    watch_format: Literal["markdown", "html", "cleaned_html"] = "markdown",
-    output_schema: Optional[dict[str, Any]] = None,
+    scope: str = "page",
+    watch_mode: str = "full_page",
+    watch_format: str = "markdown",
+    output_schema: Optional[dict] = None,
     ai_mode: bool = False,
     ai_goal: Optional[str] = None,
     use_browser: bool = False,
@@ -713,367 +538,290 @@ def monitor_create(
     wire_action_id: Optional[str] = None,
     wire_catalog_slug: Optional[str] = None,
     wire_credential_id: Optional[str] = None,
-    wire_params: Optional[dict[str, Any]] = None,
+    wire_params: Optional[dict] = None,
     wire_watch_paths: Optional[list[str]] = None,
-    base_url: str = DEFAULT_ANAKIN_BASE_URL,
-) -> dict[str, Any]:
-    """Create a scheduled website monitor that checks a URL every
-    ``interval_minutes`` (min 15) and records a change when the content
-    differs — optionally alerting a webhook or email.
+) -> Monitor:
+    """Create a scheduled website monitor.
 
-    Calls ``POST /monitors`` directly — not covered by ``anakin-sdk``
-    v0.1.0. ``scope="page"`` (default) watches one URL; ``"site"`` crawls
-    the site each run and tracks pages added/removed/changed; ``"wire"``
-    runs a Wire action each check and diffs its JSON. ``watch_mode`` of
-    ``"full_page"`` (2 credits/check) compares the whole page;
-    ``"specific_data"`` (3 credits/check) extracts only the fields in
-    ``output_schema`` with AI. ``ai_mode`` (+1 credit/check) filters out
-    trivial noise and summarizes real changes. Active-monitor caps per plan:
-    Free 5, Pro 20, Scale 100.
+    Checks ``url`` every ``interval_minutes`` (minimum 15) and records a
+    change when the content differs, optionally alerting a webhook or email.
+    ``scope="page"`` watches one URL, ``"site"`` crawls the site and tracks
+    pages added, removed and changed, and ``"wire"`` runs a Wire action each
+    check and diffs its JSON. ``watch_mode="specific_data"`` tracks only the
+    fields in ``output_schema`` (prices, stock, status). ``ai_mode`` filters
+    out trivial changes and summarizes real ones. See
+    https://anakin.io/pricing for the credit cost per check and the
+    active-monitor limit on each plan.
 
-    :param url: The URL to watch (root URL for site scope; the Wire site's
-        URL for wire scope).
-    :param interval_minutes: Check frequency in minutes. Minimum 15.
-    :param scope: What to monitor: one page, a whole site, or a Wire action.
-    :param watch_mode: Compare the whole page, or only the fields in
-        ``output_schema`` extracted with AI.
-    :param watch_format: Format compared in ``full_page`` mode.
-    :param output_schema: JSON Schema of the fields to track. Required when
-        ``watch_mode`` is ``"specific_data"``.
-    :param ai_mode: AI meaningful-change filtering.
-    :param ai_goal: Natural-language description of which changes count as
-        meaningful (used with ``ai_mode``).
-    :param use_browser: Render checks with a stealth headless browser.
-        Forced true server-side when ``session_id`` is set.
-    :param country: Two-letter proxy country code.
-    :param session_id: Saved browser-session ID for monitoring
-        login-protected pages (see :func:`session_list`).
-    :param is_active: Start running immediately.
-    :param expires_at: Optional end date (ISO 8601 timestamp or
-        ``YYYY-MM-DD``); the monitor auto-pauses when it passes.
-    :param alert_webhook_url: Webhook URL that receives signed change
-        alerts.
-    :param alert_emails: Comma-separated email recipients for change
-        alerts.
-    :param max_pages: Site scope: max pages crawled per run.
+    Creating a monitor isn't idempotent: don't give this task ``retries``.
+
+    :param url: The URL to watch (the root URL for site scope).
+    :param interval_minutes: Minutes between checks. Minimum 15.
+    :param scope: "page", "site" or "wire".
+    :param watch_mode: "full_page" or "specific_data".
+    :param watch_format: Compared format in full_page mode: "markdown",
+        "html" or "cleaned_html".
+    :param output_schema: JSON Schema of the fields to track. Required for
+        ``watch_mode="specific_data"``.
+    :param ai_mode: Filter out trivial changes with AI.
+    :param ai_goal: Which changes count as meaningful (used with ``ai_mode``).
+    :param use_browser: Check with a headless browser.
+    :param country: Proxy country code.
+    :param session_id: Saved browser session for login-protected pages.
+    :param is_active: Start checking immediately.
+    :param expires_at: End date (ISO 8601 or ``YYYY-MM-DD``); the monitor pauses then.
+    :param alert_webhook_url: Webhook that receives signed change alerts.
+    :param alert_emails: Comma-separated email recipients for change alerts.
+    :param max_pages: Site scope: maximum pages per run.
     :param max_depth: Site scope: crawl depth (1-5).
-    :param include_patterns: Site scope: glob patterns or hand-picked
-        same-site URLs to track.
-    :param exclude_patterns: Site scope: glob patterns to skip.
-    :param wire_action_id: Wire scope (required there): the action run each
-        check, e.g. ``"amazon.search_products"`` (see :func:`wire_discover`).
-    :param wire_catalog_slug: Wire scope: catalog slug of the Wire site.
-    :param wire_credential_id: Wire scope: credential ID when the action
-        needs auth (see :func:`wire_identities`).
-    :param wire_params: Wire scope: parameters passed to the action each
-        check.
-    :param wire_watch_paths: Wire scope: JSON paths to diff instead of the
-        whole response.
-    :param base_url: Anakin API base URL; override only for internal/test
-        environments.
+    :param include_patterns: Site scope: patterns or URLs to track.
+    :param exclude_patterns: Site scope: patterns to skip.
+    :param wire_action_id: Wire scope (required there): the action to run each check.
+    :param wire_catalog_slug: Wire scope: the action's catalog slug.
+    :param wire_credential_id: Wire scope: credential for actions that need auth.
+    :param wire_params: Wire scope: parameters for the action.
+    :param wire_watch_paths: Wire scope: JSON paths to diff instead of the whole result.
+    :return: The new monitor. The webhook signing secret is redacted; read it
+        in the Anakin dashboard.
     """
-    api_key = _resolve_api_key()
-    body: dict[str, Any] = {"url": url, "intervalMinutes": interval_minutes}
-    extras: dict[str, Any] = {
+    logger.info("Creating monitor for %s (scope=%s, every %dm)", url, scope, interval_minutes)
+    options: dict[str, Any] = {
         "scope": scope,
-        "watchMode": watch_mode,
-        "watchFormat": watch_format,
-        "outputSchema": output_schema,
-        "aiMode": ai_mode,
-        "aiGoal": ai_goal,
-        "useBrowser": use_browser,
+        "watch_mode": watch_mode,
+        "watch_format": watch_format,
+        "ai_mode": ai_mode,
+        "use_browser": use_browser,
         "country": country,
-        "sessionId": session_id,
-        "isActive": is_active,
-        "expiresAt": expires_at,
-        "alertWebhookUrl": alert_webhook_url,
-        "alertEmails": alert_emails,
-        "maxPages": max_pages,
-        "maxDepth": max_depth,
-        "includePatterns": include_patterns,
-        "excludePatterns": exclude_patterns,
-        "wireActionId": wire_action_id,
-        "wireCatalogSlug": wire_catalog_slug,
-        "wireCredentialId": wire_credential_id,
-        "wireParams": wire_params,
-        "wireWatchPaths": wire_watch_paths,
+        "is_active": is_active,
     }
-    # Only send fields the caller actually set — the API applies its own
-    # defaults for the rest (matches anakin-mcp's monitor_create passthrough).
-    body.update({k: v for k, v in extras.items() if v is not None})
-    result = _http.as_dict(
-        _http.request("POST", "/monitors", api_key=api_key, base_url=base_url, json=body)
-    )
-    return _redact_monitor_secrets(result)
+    optional: dict[str, Any] = {
+        "output_schema": output_schema,
+        "ai_goal": ai_goal,
+        "session_id": session_id,
+        "expires_at": expires_at,
+        "alert_webhook_url": alert_webhook_url,
+        "alert_emails": alert_emails,
+        "max_pages": max_pages,
+        "max_depth": max_depth,
+        "include_patterns": include_patterns,
+        "exclude_patterns": exclude_patterns,
+        "wire_action_id": wire_action_id,
+        "wire_catalog_slug": wire_catalog_slug,
+        "wire_credential_id": wire_credential_id,
+        "wire_params": wire_params,
+        "wire_watch_paths": wire_watch_paths,
+    }
+    options.update({k: v for k, v in optional.items() if v is not None})
+
+    monitor = _client().monitors.create(url, interval_minutes, **options)
+    logger.info("Created monitor %s for %s", monitor.id, url)
+    return _redact(monitor)
 
 
-@task(secret_requests=[_ANAKIN_SECRET_REQUEST])
-def monitor_list(
-    monitor_id: Optional[str] = None,
-    base_url: str = DEFAULT_ANAKIN_BASE_URL,
-) -> dict[str, Any]:
-    """List your website monitors, or pass ``monitor_id`` to fetch one
-    monitor's full configuration and status (next/last check time, active
-    state, per-check credit cost, alert settings).
+@task(secret_requests=[_SECRET])
+def monitor_list() -> list[Monitor]:
+    """List your website monitors.
 
-    Calls ``GET /monitors`` (or ``GET /monitors/:id``) directly — not
-    covered by ``anakin-sdk`` v0.1.0. Use this to find a monitor's id before
-    :func:`monitor_changes` or :func:`monitor_control`.
-
-    :param monitor_id: Fetch just this monitor instead of the full list.
-    :param base_url: Anakin API base URL; override only for internal/test
-        environments.
+    :return: Every monitor, with webhook signing secrets redacted.
     """
-    api_key = _resolve_api_key()
-    path = f"/monitors/{quote(monitor_id, safe='')}" if monitor_id else "/monitors"
-    result = _http.as_dict(_http.request("GET", path, api_key=api_key, base_url=base_url))
-    return _redact_monitor_secrets(result)
+    return [_redact(m) for m in _client().monitors.list()]
 
 
-@task(secret_requests=[_ANAKIN_SECRET_REQUEST])
-def monitor_changes(
-    monitor_id: str,
-    base_url: str = DEFAULT_ANAKIN_BASE_URL,
-) -> dict[str, Any]:
-    """Get the detected changes for a monitor — each entry records when the
-    watched content differed from the previous check, with a diff/summary
-    (and the AI change summary when ``ai_mode`` was on).
+@task(secret_requests=[_SECRET])
+def monitor_get(monitor_id: str) -> Monitor:
+    """Fetch one monitor's configuration and status.
 
-    Calls ``GET /monitors/:id/changes`` directly — not covered by
-    ``anakin-sdk`` v0.1.0. Use :func:`monitor_list` first to find the
-    monitor id.
-
-    :param monitor_id: The monitor ID.
-    :param base_url: Anakin API base URL; override only for internal/test
-        environments.
+    :param monitor_id: The monitor's ``id``.
+    :return: The monitor, with its webhook signing secret redacted.
     """
-    api_key = _resolve_api_key()
-    result = _http.as_dict(
-        _http.request(
-            "GET",
-            f"/monitors/{quote(monitor_id, safe='')}/changes",
-            api_key=api_key,
-            base_url=base_url,
+    return _redact(_client().monitors.get(monitor_id))
+
+
+@task(secret_requests=[_SECRET])
+def monitor_changes(monitor_id: str) -> list[MonitorChange]:
+    """Get the changes a monitor has detected, newest first.
+
+    :param monitor_id: The monitor's ``id``.
+    :return: One entry per detected change, with its diff and (when
+        ``ai_mode`` is on) the AI summary.
+    """
+    logger.info("Fetching changes for monitor %s", monitor_id)
+    return _client().monitors.changes(monitor_id)
+
+
+@task(secret_requests=[_SECRET])
+def monitor_control(monitor_id: str, action: str) -> Optional[dict]:
+    """Pause, resume, run, or delete a monitor.
+
+    :param monitor_id: The monitor's ``id``.
+    :param action: "pause", "resume", "run_now" (an immediate check, billed
+        like a scheduled one) or "delete" (removes the monitor and its history).
+    :return: The updated monitor for pause/resume, the queued run
+        (``success``, ``job_id``, ``message``) for run_now, and None for delete.
+    """
+    if action not in _MONITOR_ACTIONS:
+        raise ValueError(
+            f"Unknown monitor action {action!r}: use one of {', '.join(_MONITOR_ACTIONS)}."
         )
-    )
-    return _redact_monitor_secrets(result)
+
+    logger.info("Monitor %s: %s", monitor_id, action)
+    monitors = _client().monitors
+    if action == "delete":
+        monitors.delete(monitor_id)
+        return None
+    if action == "pause":
+        result: BaseModel = monitors.pause(monitor_id)
+    elif action == "resume":
+        result = monitors.resume(monitor_id)
+    else:
+        result = monitors.run_now(monitor_id)
+    return _redact(result).model_dump(mode="json")
 
 
-@task(secret_requests=[_ANAKIN_SECRET_REQUEST])
-def monitor_control(
-    monitor_id: str,
-    action: Literal["pause", "resume", "run_now", "delete"],
-    base_url: str = DEFAULT_ANAKIN_BASE_URL,
-) -> dict[str, Any]:
-    """Control an existing website monitor: ``"pause"`` stops scheduled
-    checks, ``"resume"`` restarts them (may hit the plan's active-monitor
-    cap), ``"run_now"`` triggers an immediate out-of-schedule check (billed
-    like a normal check), and ``"delete"`` permanently removes the monitor
-    and its history.
+# ─── AI visibility ──────────────────────────────────────────────────────────
 
-    Calls ``POST /monitors/:id/{pause,resume,run}`` or
-    ``DELETE /monitors/:id`` directly — not covered by ``anakin-sdk``
-    v0.1.0. Use :func:`monitor_list` to find the id.
 
-    :param monitor_id: The monitor ID.
-    :param action: What to do with the monitor.
-    :param base_url: Anakin API base URL; override only for internal/test
-        environments.
+@task(secret_requests=[_SECRET])
+def ai_visibility_sources() -> list[AIVisibilitySource]:
+    """List the AI answer engines ``ai_visibility_search`` can query.
+
+    :return: Each engine's slug (pass these as ``sources``) and display name.
     """
-    api_key = _resolve_api_key()
-    base = f"/monitors/{quote(monitor_id, safe='')}"
-    method_path = {
-        "pause": ("POST", f"{base}/pause"),
-        "resume": ("POST", f"{base}/resume"),
-        "run_now": ("POST", f"{base}/run"),
-        "delete": ("DELETE", base),
-    }[action]
-    method, path = method_path
-    result = _http.as_dict(_http.request(method, path, api_key=api_key, base_url=base_url))
-    return _redact_monitor_secrets(result)
+    return _client().ai_visibility.sources()
 
 
-# ─── AI visibility (raw HTTP — not in anakin-sdk) ───────────────────────────
-
-
-@task(secret_requests=[_ANAKIN_SECRET_REQUEST])
-def ai_visibility_sources(
-    base_url: str = DEFAULT_ANAKIN_BASE_URL,
-) -> dict[str, Any]:
-    """List the AI answer engines available to :func:`ai_visibility_search`
-    — each with its slug (what's passed as ``sources``) and display label.
-
-    Calls ``GET /ai-visibility/sources`` directly — not covered by
-    ``anakin-sdk`` v0.1.0.
-
-    :param base_url: Anakin API base URL; override only for internal/test
-        environments.
-    """
-    api_key = _resolve_api_key()
-    return _http.as_dict(
-        _http.request("GET", "/ai-visibility/sources", api_key=api_key, base_url=base_url)
-    )
-
-
-@task(secret_requests=[_ANAKIN_SECRET_REQUEST])
+@task(secret_requests=[_SECRET])
 def ai_visibility_search(
     query: str,
     sources: Optional[list[str]] = None,
     country: str = "us",
     include_full_content: bool = False,
     poll_timeout: Optional[float] = None,
-    base_url: str = DEFAULT_ANAKIN_BASE_URL,
-) -> dict[str, Any]:
-    """Ask multiple AI answer engines (ChatGPT, Gemini, Google AI Overview,
-    ...) the same question and compare their answers.
+) -> AIVisibilitySearch:
+    """Ask several AI answer engines (ChatGPT, Gemini, Google AI Overview, ...) one question.
 
-    Calls ``POST /ai-visibility/search`` then polls
-    ``GET /ai-visibility/search/:id`` directly (until the response's
-    ``status`` is no longer ``"running"``) — not covered by ``anakin-sdk``
-    v0.1.0. Returns one result per engine plus an AI-generated synthesis of
-    where the engines agree and diverge. Billed per source; failed sources
-    are free. A ``"failed"`` overall status is still returned (not raised)
-    since the payload carries per-source results and errors either way —
-    same behavior anakin-mcp's ``aiVisibilitySearch`` documents.
+    Useful for checking how a brand or topic shows up in AI answers, per
+    country. Billed per engine that answers; failed engines are free. A
+    search where some engines failed is returned, not raised.
 
-    :param query: The question to ask every engine (max 2000 characters).
-    :param sources: Engine slugs to query (see
-        :func:`ai_visibility_sources`). Omit to query all enabled engines.
-    :param country: Two-letter ISO country for the search geography (proxy
-        exit).
-    :param include_full_content: Include each engine's raw full answer in
-        the results (large). Summaries and the synthesis are returned
-        regardless.
-    :param poll_timeout: Seconds to wait for the search to finish; defaults
-        to ``_http.DEFAULT_POLL_TIMEOUT`` (180s) when unset.
-    :param base_url: Anakin API base URL; override only for internal/test
-        environments.
+    :param query: The question (max 2000 characters).
+    :param sources: Engine slugs from ``ai_visibility_sources``. Omit for all.
+    :param country: Two-letter country code for the search location.
+    :param include_full_content: Keep each engine's full answer text. Off by
+        default; summaries and the cross-engine synthesis are always returned.
+    :param poll_timeout: Seconds to wait for the search (SDK default: 300).
+    :return: ``search_id``, ``status``, ``synthesis`` and one ``results``
+        entry per engine.
     """
-    api_key = _resolve_api_key()
-    body: dict[str, Any] = {"query": query, "country": country}
-    if sources is not None:
-        body["sources"] = sources
-    submitted = _http.as_dict(
-        _http.request(
-            "POST", "/ai-visibility/search", api_key=api_key, base_url=base_url, json=body
-        )
+    logger.info("Running AI visibility search: %s", query)
+    result = _client().ai_visibility.search(
+        query, sources=sources, country=country, poll_timeout=poll_timeout
     )
-    search_id = submitted.get("search_id")
-    if search_id and submitted.get("status") == "running":
-        search = _http.poll(
-            f"/ai-visibility/search/{quote(str(search_id), safe='')}",
-            api_key=api_key,
-            base_url=base_url,
-            is_terminal=lambda body: body.get("status") != "running",
-            poll_timeout=(
-                poll_timeout if poll_timeout is not None else _http.DEFAULT_POLL_TIMEOUT
-            ),
-        )
-    else:
-        search = submitted
-
-    results = search.get("results") or []
     if not include_full_content:
-        results = [{k: v for k, v in r.items() if k != "full_content"} for r in results]
-
-    return {
-        "search_id": search.get("search_id"),
-        "status": search.get("status"),
-        "country": search.get("country"),
-        "synthesis": search.get("synthesis"),
-        "results": results,
-    }
+        result = result.model_copy(
+            update={
+                "results": [r.model_copy(update={"full_content": None}) for r in result.results]
+            }
+        )
+    logger.info("AI visibility search %s: %s", result.search_id, result.status)
+    return result
 
 
-# ─── AI browser automation (raw HTTP — not in anakin-sdk) ──────────────────
+# ─── Browser sessions and AI browser tasks ──────────────────────────────────
 
 
-@task(secret_requests=[_ANAKIN_SECRET_REQUEST])
+@task(secret_requests=[_SECRET])
+def session_list(domain: Optional[str] = None) -> list[BrowserSession]:
+    """List saved browser sessions (logged-in states you created in the Anakin dashboard).
+
+    Pass a session's ``id`` as ``session_id`` to ``scrape_url``,
+    ``crawl_site``, ``monitor_create`` or ``browser_task`` to run as that
+    logged-in user.
+
+    :param domain: Only sessions for this domain, e.g. "amazon.com".
+    :return: Sessions with ``id``, ``name``, ``website_domain`` and ``is_active``.
+    """
+    return _client().sessions.list(domain=domain)
+
+
+@task(secret_requests=[_SECRET])
+def session_delete(session_id: str) -> None:
+    """Permanently delete a saved browser session and its encrypted login data.
+
+    Anything that uses this session loses its logged-in access.
+
+    :param session_id: The session's ``id``, from ``session_list``.
+    """
+    logger.info("Deleting browser session %s", session_id)
+    _client().sessions.delete(session_id)
+
+
+@task(secret_requests=[_SECRET])
 def browser_task(
     prompt: str,
     url: Optional[str] = None,
     session_id: Optional[str] = None,
     max_steps: Optional[int] = None,
     timeout_ms: Optional[int] = None,
-    output_schema: Optional[dict[str, Any]] = None,
-    poll_timeout: Optional[float] = None,
-    base_url: str = DEFAULT_ANAKIN_BASE_URL,
-) -> dict[str, Any]:
-    """Run a natural-language task in a real cloud browser driven by an AI
-    agent: it navigates, clicks, types, scrolls, and extracts on your
-    behalf.
+    output_schema: Optional[dict] = None,
+) -> dict:
+    """Run a task described in plain language in a cloud browser driven by an AI agent.
 
-    Calls ``POST /ai/evaluate`` (always in async mode — the sync variant
-    blocks for up to ~5.5 minutes, far past a normal request timeout) then
-    polls ``GET /ai/jobs/:id`` directly — not covered by ``anakin-sdk``
-    v0.1.0. Use when :func:`scrape_url`/:func:`crawl_site` can't do the job
-    (multi-step flows, interactions, complex navigation) and no Wire action
-    covers the site (check :func:`wire_discover` first — Wire actions are
-    faster and cheaper). Server hard-caps a run at ~330s.
+    The agent navigates, clicks, types and extracts. Use it for multi-step
+    flows ``scrape_url`` can't do and no Wire action covers (Wire actions are
+    faster and cheaper, so try ``wire_discover`` first). Runs are capped at
+    about 330 seconds server-side. For logged-in tasks pass ``session_id``;
+    never put passwords in ``prompt``. Refuses payment or fund-transfer tasks
+    (raises ``ValueError``).
 
-    :param prompt: The task in natural language. Be specific about the goal
-        and what to return. Never include passwords or secrets — use
-        ``session_id`` for authenticated sites.
-    :param url: Navigate here before starting. Omit to let the agent follow
-        URLs named in the prompt.
-    :param session_id: Saved browser-session ID (see :func:`session_list`)
-        so the task runs logged in.
-    :param max_steps: Cap on agent steps (navigation/click/type actions).
-    :param timeout_ms: Task timeout in milliseconds (server caps runs at
-        ~330s regardless).
-    :param output_schema: JSON Schema for the result — the agent returns
-        structured data conforming to it.
-    :param poll_timeout: Seconds to wait for the task to finish; defaults to
-        ``_http.BROWSER_TASK_POLL_TIMEOUT`` (360s) when unset — longer than
-        other jobs in this package since the server itself allows runs up
-        to ~330s.
-    :param base_url: Anakin API base URL; override only for internal/test
-        environments.
+    :param prompt: What to do and what to return.
+    :param url: Start here. Omit to let the agent follow URLs in the prompt.
+    :param session_id: Saved browser session to run as a logged-in user.
+    :param max_steps: Maximum agent steps.
+    :param timeout_ms: Task timeout in milliseconds.
+    :param output_schema: JSON Schema the returned ``result`` should follow.
+    :return: ``success``, ``result``, ``steps_taken``, ``iterations``,
+        ``cached``, ``duration_ms`` and ``run_id``.
+    :raises RuntimeError: If the task fails or times out.
     """
-    api_key = _resolve_api_key()
+    _refuse_if_financial(f"{prompt} {url or ''}", "browser task")
+
+    logger.info("Running browser task: %s", prompt)
     body: dict[str, Any] = {"prompt": prompt, "async": True}
-    if url is not None:
-        body["url"] = url
-    if session_id is not None:
-        body["session_id"] = session_id
-    if max_steps is not None:
-        body["max_steps"] = max_steps
-    if timeout_ms is not None:
-        body["timeout_ms"] = timeout_ms
-    if output_schema is not None:
-        body["output_schema"] = output_schema
+    optional = {
+        "url": url,
+        "session_id": session_id,
+        "max_steps": max_steps,
+        "timeout_ms": timeout_ms,
+        "output_schema": output_schema,
+    }
+    body.update({k: v for k, v in optional.items() if v is not None})
 
-    accepted = _http.as_dict(
-        _http.request("POST", "/ai/evaluate", api_key=api_key, base_url=base_url, json=body)
-    )
-    workflow_id = accepted.get("workflow_id")
-    if not workflow_id:
-        # Service answered synchronously (shouldn't happen with async=True).
-        job = accepted
-    else:
-        job = _http.poll(
-            f"/ai/jobs/{quote(str(workflow_id), safe='')}",
-            api_key=api_key,
-            base_url=base_url,
-            is_terminal=lambda body: body.get("status") in {"completed", "failed", "timed_out"},
-            poll_interval=_http.DEFAULT_POLL_INTERVAL,
-            poll_timeout=(
-                poll_timeout if poll_timeout is not None else _http.BROWSER_TASK_POLL_TIMEOUT
-            ),
-        )
-        if job.get("status") in {"failed", "timed_out"}:
-            raise _http.AnakinAPIError(
-                f"Browser task {job.get('status')}: {job.get('error', 'unknown')}",
-                code=str(job.get("status")).upper(),
+    with _http_client() as http_client:
+        accepted = _http.request(http_client, "POST", "/ai/evaluate", json=body)
+        workflow_id = accepted.get("workflow_id")
+        if not workflow_id:
+            resolved = accepted
+        else:
+            job = _http.poll(
+                http_client,
+                f"/ai/jobs/{workflow_id}",
+                is_terminal=lambda b: b.get("status") in {"completed", "failed", "timed_out"},
             )
+            if job.get("status") in {"failed", "timed_out"}:
+                raise RuntimeError(
+                    f"Browser task {job.get('status')}: {job.get('error', 'unknown')}"
+                )
+            resolved = job.get("result") or job
 
-    result = job.get("result") if isinstance(job.get("result"), dict) else job
+    logger.info("Browser task finished (run_id=%s)", resolved.get("run_id"))
+    steps = resolved.get("steps")
     return {
-        "success": result.get("success"),
-        "result": result.get("result"),
-        "steps_taken": len(result["steps"]) if isinstance(result.get("steps"), list) else None,
-        "iterations": result.get("iterations"),
-        "cached": result.get("cached"),
-        "duration_ms": result.get("duration_ms"),
-        "run_id": result.get("run_id"),
+        "success": resolved.get("success"),
+        "result": resolved.get("result"),
+        "steps_taken": len(steps) if isinstance(steps, list) else None,
+        "iterations": resolved.get("iterations"),
+        "cached": resolved.get("cached"),
+        "duration_ms": resolved.get("duration_ms"),
+        "run_id": resolved.get("run_id"),
     }
